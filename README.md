@@ -111,7 +111,7 @@ Tests mock `gh`; they never touch GitHub. Client request-state tests use minimal
 
 The optional Board browser regression uses Playwright and the real loopback server with a stubbed GitHub adapter. With Playwright and its Chromium browser installed, run `node --test tests/board-browser.mjs`. Set `PLAYWRIGHT_CHROME_CHANNEL=chrome` to use an installed Google Chrome instead.
 
-Planned work is in [TODO.md](TODO.md).
+See [CHANGELOG.md](CHANGELOG.md) for recent changes and [TODO.md](TODO.md) for planned work.
 
 ## License
 
