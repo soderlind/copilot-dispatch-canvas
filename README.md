@@ -2,6 +2,10 @@
 
 A Copilot app canvas (`dispatch`) that shows what each teammate and the Copilot coding agent is working on, so you can hand out new work to whoever has room. It is a user-scope extension in `~/.copilot/extensions/dispatch/`, based on [tinyclips-team-load](https://github.com/jamesmontemagno/tiny-clips/tree/main/.github/extensions/tinyclips-team-load). There is no `config.json`: you choose repos in the canvas, and the people come from those repos.
 
+![Dispatch canvas showing an example team workload, unassigned issues, and activity chart](docs/dispatch-canvas.png)
+
+*Screenshot uses fictional people and repository data.*
+
 Use the sun/moon button beside Refresh to switch between light and dark themes. The canvas follows the system theme until you choose one; your choice applies to every view until the page reloads.
 
 ## Install
@@ -55,6 +59,10 @@ When the scope is missing, the Board shows **Grant Project access**. It runs `gh
 
 Open **Board** and link an editable GitHub Project with a single-select `Status` field. The canvas checks the tracked repo owners and the signed-in user's Projects. Reuse an existing Project if it fits your repos. If none of the listed Projects fit, choose to create one under the common repo owner, or choose an owner when repos have different owners. Creation requires explicit confirmation. Each global or Copilot Project tracking scope stores its own link and Board settings.
 
+![Dispatch Board showing example issues and pull requests across four status columns](docs/dispatch-board.png)
+
+*Board screenshot uses fictional project and repository data.*
+
 Existing Project cards appear as soon as the Project is read; the Board syncs open issues and PRs from tracked repos in the background and shows a sync notice. Refresh adds new open work automatically while the canvas is active. Status ages are also fetched in the background with bounded concurrency. Untracking a repo hides its cards without removing anything from the GitHub Project. Moving a card changes only its Project Status. Closed and merged work stays in the status GitHub reports and gets a badge; workflows configured in GitHub can still change or archive items independently. If an Iteration field exists, the Board shows its values but never manages sprints.
 
 In **Board settings**, leave WIP limits blank to disable them. Limits count open, unarchived cards and warn at or above the limit without blocking moves. Cards are highlighted after seven days in status by default. Age comes from GitHub's status-change timeline; if the exact date can't be established, the card says **Status age unavailable**.
@@ -105,7 +113,7 @@ cd ~/.copilot/extensions/dispatch && node --test tests/
 
 Tests mock `gh`; they never touch GitHub. Client request-state tests use minimal DOM fixtures and deferred responses to cover bulk controls, navigation during edits, label Undo, Momentum selection changes, tracking races, and same-selection stale-data fallback without browser dependencies. Project detection is tested against fixture `events.jsonl` files.
 
-The optional Board browser regression uses Playwright and the real loopback server with a stubbed GitHub adapter. With Playwright and its Chromium browser installed, run `node --test tests/board-browser.mjs`. Set `PLAYWRIGHT_CHROME_CHANNEL=chrome` to use an installed Google Chrome instead.
+The optional Board browser regression uses Playwright and the real loopback server with a stubbed GitHub adapter. Run `npm ci` and `npx playwright install chromium` once, then run `node --test tests/board-browser.mjs`. Set `PLAYWRIGHT_CHROME_CHANNEL=chrome` to use an installed Google Chrome instead.
 
 See [CHANGELOG.md](CHANGELOG.md) for recent changes and [TODO.md](TODO.md) for planned work.
 

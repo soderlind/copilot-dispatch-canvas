@@ -1,0 +1,7 @@
+{
+  "devDependencies": {
+    "playwright": "^1.65.1"
+  },
+  "name": "copilot-dispatch-canvas",
+  "private": true
+}
