@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_LIMIT, DEFAULT_REFRESH_SECONDS, TeamLoadError, normalizeTracking } from "./model.mjs";
+import { normalizeBoardSettings } from "./board.mjs";
 
 export const MAX_KNOWN_REPOS = 30;
 export const extensionRoot = dirname(fileURLToPath(import.meta.url));
@@ -44,7 +45,8 @@ export function createTrackingStore(home = process.env.COPILOT_HOME || join(home
             const tracking = normalizeTracking({ repos: data.repos, hidden: data.hidden ?? [] });
             const known = normalizeTracking({ repos: data.knownRepos ?? [] }, { maxRepos: MAX_KNOWN_REPOS });
             const seen = normalizeTracking({ repos: data.projectRepos ?? [] }, { maxRepos: MAX_PROJECT_REPOS });
-            return { ...tracking, knownRepos: known.repos, ...settingsOf(data), projectRepos: seen.repos };
+            const board = data.board == null ? {} : { board: normalizeBoardSettings(data.board) };
+            return { ...tracking, knownRepos: known.repos, ...settingsOf(data), ...board, projectRepos: seen.repos };
         } catch (error) {
             throw new TeamLoadError("storage_error", `Tracking file ${file} is invalid (${error.message}). Move or delete it to reset.`);
         }
@@ -70,9 +72,11 @@ export function createTrackingStore(home = process.env.COPILOT_HOME || join(home
             const projectRepos = project ? normalizeTracking({ repos: next.projectRepos ?? current.projectRepos }, { maxRepos: MAX_PROJECT_REPOS }).repos : null;
             const knownRepoMap = new Map([...current.knownRepos, ...(projectRepos ?? []), ...current.repos, ...tracking.repos].map(repo => [repo.toLowerCase(), repo]));
             const knownRepos = [...knownRepoMap.values()].slice(-MAX_KNOWN_REPOS);
-            const value = { ...tracking, knownRepos, limit: current.limit, refreshSeconds: current.refreshSeconds, ...(project ? { projectRepos } : {}) };
-            // Settings stay hand-edited in the global file only.
-            const saved = project ? { project, ...tracking, knownRepos, projectRepos } : value;
+            const board = Object.hasOwn(next, "board") ? next.board : current.board;
+            const boardSettings = board == null ? {} : { board: normalizeBoardSettings(board) };
+            const value = { ...tracking, knownRepos, limit: current.limit, refreshSeconds: current.refreshSeconds, ...boardSettings, ...(project ? { projectRepos } : {}) };
+            // Workload and refresh settings stay global; Board settings belong to this scope.
+            const saved = project ? { project, ...tracking, knownRepos, projectRepos, ...boardSettings } : value;
             const temporary = join(dirname(path), `tracking.${randomUUID()}.tmp`);
             let created = false;
             try {

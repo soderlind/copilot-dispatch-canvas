@@ -32,6 +32,19 @@ export async function perform(context, name, input = {}) {
         case "get_labels": return hub.repoLabels(input);
         case "label": return hub.editLabel(input);
         case "set_item_state": return hub.setItemState(input);
+        case "get_board": {
+            if (Object.keys(input).some(key => key !== "force") || (input.force !== undefined && typeof input.force !== "boolean")) {
+                throw new TeamLoadError("invalid_input", "get_board accepts only { force: boolean }.");
+            }
+            return hub.board.refresh(input);
+        }
+        case "connect_board": {
+            await hub.board.connect(input);
+            return hub.refresh();
+        }
+        case "configure_board": await hub.board.configure(input); return hub.state();
+        case "move_board_card": await hub.board.move(input); return hub.state();
+        case "disconnect_board": await hub.board.disconnect(input); return hub.state();
         default: throw new TeamLoadError("invalid_input", "Unknown Team Load action.");
     }
 }
@@ -41,6 +54,7 @@ const assets = new Map([
     ["/markdown.mjs", ["assets/markdown.mjs", "text/javascript"]],
     ["/icons.mjs", ["assets/icons.mjs", "text/javascript"]],
     ["/momentum.mjs", ["assets/momentum.mjs", "text/javascript"]],
+    ["/board.mjs", ["assets/board.mjs", "text/javascript"]],
     ["/styles.css", ["assets/styles.css", "text/css"]],
     ["/model.mjs", ["model.mjs", "text/javascript"]],
 ]);

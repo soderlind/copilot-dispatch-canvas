@@ -42,12 +42,12 @@ const labelFields = "labels(first:20){nodes{name color}}";
 const issuesQuery = `query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){
   issues(states:OPEN,first:100,after:$after,orderBy:{field:UPDATED_AT,direction:DESC}){
     pageInfo{hasNextPage endCursor}
-    nodes{number title url updatedAt ${labelFields} assignees(first:20){nodes{login}}}
+    nodes{id number title url updatedAt ${labelFields} assignees(first:20){nodes{login}}}
   }}}`;
 const pullsQuery = `query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){
   pullRequests(states:OPEN,first:100,after:$after,orderBy:{field:UPDATED_AT,direction:DESC}){
     pageInfo{hasNextPage endCursor}
-    nodes{number title url updatedAt isDraft author{login} ${labelFields} assignees(first:20){nodes{login}}
+    nodes{id number title url updatedAt isDraft author{login} ${labelFields} assignees(first:20){nodes{login}}
       reviewRequests(first:20){nodes{requestedReviewer{__typename ... on User{login} ... on Bot{login}}}}}
   }}}`;
 const infoQuery = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){
@@ -140,7 +140,8 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         try {
             try { return await run(args, options); }
             catch (error) {
-                const write = args.includes("--method") || args[0] === "issue" || args[0] === "pr";
+                const write = args.includes("--method") || args[0] === "issue" || args[0] === "pr"
+                    || args.some(arg => arg.startsWith("query=mutation"));
                 if (write || !/HTTP 50[234]|timed out|ETIMEDOUT|ECONNRESET/i.test(error.message)) throw error;
                 try { log(`Retrying a transient GitHub read once: ${error.message}`); } catch {}
                 await new Promise(resolve => setTimeout(resolve, 500));
@@ -186,8 +187,8 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
 
     async function fetchRepo(nwo) {
         const [issues, pulls] = await Promise.all([
-            paginate(issuesQuery, nwo, "issues", normalizeIssue),
-            paginate(pullsQuery, nwo, "pullRequests", normalizePull),
+            paginate(issuesQuery, nwo, "issues", (node, repo) => ({ ...normalizeIssue(node, repo), ...(node.id ? { nodeId: node.id } : {}) })),
+            paginate(pullsQuery, nwo, "pullRequests", (node, repo) => ({ ...normalizePull(node, repo), ...(node.id ? { nodeId: node.id } : {}) })),
         ]);
         return [...issues, ...pulls];
     }
@@ -470,5 +471,5 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         return { itemState: state };
     }
 
-    return { fetchRepo, history, repoInfo, viewerRepos, ownerRepos, profile, remember, me, detail, readIssue, assign, unassign, reassign, comment, deleteComment, repoLabels, editLabel, setState };
+    return { gql, gh: limited, fetchRepo, history, repoInfo, viewerRepos, ownerRepos, profile, remember, me, detail, readIssue, assign, unassign, reassign, comment, deleteComment, repoLabels, editLabel, setState };
 }

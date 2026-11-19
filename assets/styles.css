@@ -102,6 +102,34 @@ h1 { font-size: 20px; line-height: 28px; font-weight: 600; margin: 0; }
 
 /* Layout */
 .grid { display: grid; gap: 16px; }
+.seg.home-tabs { width: fit-content; min-width: 180px; margin: 0 0 16px; }
+.board-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 12px; }
+.board-header h2, .board-form h2 { margin: 0; font-size: 16px; }
+.board-header a { color: var(--fgColor-accent); }
+.board-columns { display: flex; align-items: flex-start; gap: 12px; overflow-x: auto; padding: 2px 2px 12px; }
+.board-column { flex: 1 0 215px; min-width: min(215px, 85%); background: var(--bgColor-muted); }
+.board-column > header { padding: 10px 12px; }
+.board-column h3, .board-column p { margin: 0; }
+.board-column h3 { font-size: 14px; overflow-wrap: anywhere; }
+.board-column ul { display: grid; gap: 8px; list-style: none; padding: 0 8px 8px; margin: 0; }
+.board-drop { outline: 2px solid var(--focus-outlineColor); outline-offset: -2px; }
+.board-card { display: grid; gap: 6px; background: var(--bgColor-default); border: 1px solid var(--borderColor-default); border-radius: 8px; padding: 10px; overflow-wrap: anywhere; }
+.board-card[draggable="true"] { cursor: grab; }
+.board-card a { color: var(--fgColor-accent); font-weight: 600; }
+.board-card a:hover, .board-header a:hover { text-decoration: underline; }
+.board-card-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; font-size: 12px; }
+.board-badge, .board-warning { border-radius: 6px; padding: 1px 5px; background: var(--bgColor-neutral-muted); }
+.board-warning { width: fit-content; color: var(--fgColor-attention); background: var(--bgColor-attention-muted); font-weight: 600; }
+.board-card select, .board-form select, .board-form input:not([type="checkbox"]) {
+  font: inherit; color: inherit; background: var(--bgColor-default); border: 1px solid var(--borderColor-default);
+  border-radius: 6px; padding: 4px 8px; max-width: 100%; min-width: 0;
+}
+.board-form { display: grid; justify-items: start; gap: 10px; max-width: 540px; padding: 12px; }
+.board-form p { margin: 0; }
+.board-form input[type="number"] { width: 7em; }
+.board-settings { margin-top: 12px; }
+.board-settings > summary { cursor: pointer; }
+.board-settings > p { margin: 4px 0; }
 .side-col { display: grid; gap: 16px; min-width: 0; }
 @media (min-width: 960px) {
   .app { padding: 24px 32px; }

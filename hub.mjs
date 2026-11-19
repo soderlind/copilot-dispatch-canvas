@@ -1,5 +1,7 @@
 import { AGENT, DEFAULT_LIMIT, DEFAULT_REFRESH_SECONDS, MAX_REPOS, TeamLoadError, canonLogin, dailyMomentum, globMatcher, isRepoGlob, normalizeTracking, repoPattern, validateEdit, validateItemRef, validateMomentumInput, validateSessionBatch, validateTrackingInput } from "./model.mjs";
 import { createGitHub } from "./github.mjs";
+import { createBoardGitHub } from "./board-github.mjs";
+import { createBoard } from "./board.mjs";
 
 const STALE_MS = 30_000;
 const RECENT_TTL_MS = 10 * 60_000;
@@ -35,6 +37,28 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
         if (!tracking) tracking = await store.read();
         return tracking;
     }
+
+    const board = createBoard({
+        github: createBoardGitHub(github, now), tracking: loadTracking, now, log: diagnose,
+        save: serial(async board => {
+            tracking = await store.write({ ...await loadTracking(), board });
+            bump();
+        }),
+        async openWork(names) {
+            await Promise.all(names.map(name => {
+                const entry = repos.get(name.toLowerCase());
+                return entry?.pending ?? (entry?.status === "ready" && now() - entry.fetchedAt <= STALE_MS
+                    ? null : refreshRepo(name, { wait: true }));
+            }));
+            const items = [], warnings = [];
+            for (const name of names) {
+                const entry = repos.get(name.toLowerCase());
+                if (entry?.status === "ready") items.push(...entry.items);
+                else warnings.push(`Could not sync open work from ${name}: ${entry?.error?.message ?? "repository data unavailable"}`);
+            }
+            return { items, warnings };
+        },
+    });
 
     function track(promise) {
         inflight.add(promise);
@@ -108,6 +132,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
             refreshInfo(name, force);
         }
         for (const name of current.knownRepos) if (!infos.has(name.toLowerCase())) refreshInfo(name, false);
+        if (current.board) board.refresh({ force }).catch(error => diagnose(`Team Load Board: ${error.message}`));
         return state();
     }
 
@@ -151,6 +176,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
         const hidden = new Set(current.hidden);
         return {
             revision, updatedAt, me, limit: current.limit, refreshSeconds: current.refreshSeconds, project,
+            boardProjectId: current.board?.projectId ?? null,
             refreshing: inflight.size > 0,
             tracking: { people: team.filter(login => !hidden.has(login)), repos: current.repos, hidden: current.hidden },
             directory: {
@@ -455,5 +481,5 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
         return { ...result, state: state() };
     }
 
-    return { refresh, state, setTracking: serial(setTracking), addProjectRepos: serial(addProjectRepos), assign, unassign, reassign, startSession, startSessions, detail, momentum, loadTracking, comment, deleteComment, repoLabels, editLabel, setItemState };
+    return { refresh, state, board, setTracking: serial(setTracking), addProjectRepos: serial(addProjectRepos), assign, unassign, reassign, startSession, startSessions, detail, momentum, loadTracking, comment, deleteComment, repoLabels, editLabel, setItemState };
 }

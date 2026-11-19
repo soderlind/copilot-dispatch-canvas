@@ -2,6 +2,7 @@ import { AGENT, canonLogin, computeLoad, loadOf, tone, meterScale, sortRoster, s
 import { ICONS } from "/icons.mjs";
 import { sanitizeHtml } from "/markdown.mjs";
 import { createMomentumPanel } from "/momentum.mjs";
+import { createBoardPanel } from "/board.mjs";
 
 const $ = id => document.getElementById(id);
 const root = document.documentElement;
@@ -44,6 +45,7 @@ async function post(action, input = {}) {
 
 // ---- State ----
 let S = null;           // server state
+let boardPanel = null;
 let people = [];        // computed roster
 let byLogin = new Map();
 let unowned = [];
@@ -375,7 +377,7 @@ function renderBulk() {
     document.body.classList.toggle("is-selecting", selected.size > 0);
     const bar = $("bulkbar");
     const n = selected.size;
-    bar.hidden = !n;
+    bar.hidden = !n || Boolean($("workload")?.hidden);
     if (!n) return;
     const over = n > MAX_BATCH;
     bar.innerHTML = `<span class="bulk-count"><b>${n}</b> selected${over ? ` · max ${MAX_BATCH}` : ""}</span>
@@ -450,6 +452,7 @@ function renderAll() {
     if (scope.open) renderScope();
     if (route.item) renderDetailSide();
     if (route.person) paintPerson();
+    boardPanel?.sync();
 }
 
 // ---- Data loading ----
@@ -459,6 +462,7 @@ async function load(action = "get_state", input = {}) {
     try {
         const next = await post(action, input);
         if (!S || next.revision !== S.revision || next.refreshing !== S.refreshing || action !== "get_state") { S = next; renderAll(); syncMomentum(); }
+        if (action === "refresh") boardPanel?.sync({ force: true });
         lastError = null;
     } catch (error) {
         lastError = error.message;
@@ -1250,7 +1254,7 @@ const momentumContext = () => ({
 // Panels wait for a settled state, and the server caches history, so this is cheap to call after every change.
 function syncMomentum() {
     if (!S || S.refreshing) return;
-    if (!homeEl.hidden) homeMomentum?.sync();
+    if (!homeEl.hidden && !$("workload")?.hidden) homeMomentum?.sync();
     personMomentum?.sync();
 }
 
@@ -1269,6 +1273,7 @@ function leaveView() {
 function enterHome(was) {
     homeEl.hidden = false;
     if (S) renderTriage();
+    boardPanel?.sync();
     scrollTo(0, homeScroll);
     syncMomentum();
     // Hand keyboard focus back to whatever opened the view we just left.
@@ -1327,6 +1332,17 @@ function showRoute() {
 
 // ---- Events ----
 const plainClick = event => event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+function showBoard(show) {
+    $("board").hidden = !show;
+    $("workload").hidden = show;
+    renderBulk();
+    for (const [tab, selected] of [[$("board-tab"), show], [$("workload-tab"), !show]]) {
+        tab.setAttribute("aria-selected", String(selected));
+        tab.tabIndex = selected ? 0 : -1;
+    }
+    if (show) boardPanel?.sync({ force: true });
+    else syncMomentum();
+}
 document.addEventListener("click", event => {
     const link = event.target.closest("a[data-item], a[data-person]");
     if (link && plainClick(event)) {
@@ -1343,6 +1359,7 @@ document.addEventListener("click", event => {
     if (t?.dataset.bulk === "start") return startSessions();
     if (t?.dataset.bulk === "clear") { setSelected([...selected], false); return $("triage-all").hidden ? null : $("triage-all").focus(); }
     if (!t || t.disabled) return;
+    if (t.id === "board-tab" || t.id === "workload-tab") return showBoard(t.id === "board-tab");
     if (t.id === "undo") {
         const fn = undoAction;
         if (!fn) return;
@@ -1467,6 +1484,19 @@ document.addEventListener("keydown", event => {
 });
 
 // ---- Boot ----
+boardPanel = createBoardPanel({
+    host: $("board"), content: $("board-content"), errorElement: $("board-error"),
+    announcement: $("board-announcement"), post, context: () => S, onChange: () => load(), esc, hashFor,
+});
+for (const tab of [$("workload-tab"), $("board-tab")]) {
+    tab.addEventListener("keydown", event => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const show = event.key === "End" || (event.key !== "Home" && tab.id === "workload-tab");
+        showBoard(show);
+        $(show ? "board-tab" : "workload-tab").focus();
+    });
+}
 document.querySelectorAll("[data-icon]").forEach(b => { b.innerHTML = icon(b.dataset.icon); });
 document.querySelectorAll("[data-icon-inline]").forEach(b => b.replaceWith(document.createRange().createContextualFragment(icon(b.dataset.iconInline))));
 $("roster").innerHTML = skeletonRows(5);
