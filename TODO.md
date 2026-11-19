@@ -15,7 +15,8 @@ See the [Unreleased changelog](CHANGELOG.md#unreleased) for the Board summary.
 - [x] Support drag-and-drop and keyboard-accessible status moves; open card details in the canvas.
 - [x] Keep closed and merged cards in their Project status and show a badge.
 - [x] Display the Project's existing Iteration field without managing sprints.
-- [x] Document and validate the required `project` token scope (`gh auth refresh -s project`).
+- [x] Document and validate the required `project` token scope.
+- [x] Grant the `project` scope from the canvas: run the GitHub device flow against the stored GitHub CLI login and show the one-time code and link.
 - [x] Add optional, non-blocking WIP limits per status column.
 - [x] Show time in status from GitHub's Project timeline, with a configurable highlight threshold.
 
