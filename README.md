@@ -1,6 +1,8 @@
 # Dispatch canvas
 
-A Copilot app canvas (`dispatch`) that shows what each teammate and the Copilot coding agent is working on, so you can hand out new work to whoever has room. It is a user-scope extension in `~/.copilot/extensions/dispatch/`, based on [tinyclips-team-load](https://github.com/jamesmontemagno/tiny-clips/tree/main/.github/extensions/tinyclips-team-load). There is no `config.json`: you choose repos in the canvas, and the people come from those repos.
+Dispatch is a GitHub Copilot app canvas for coordinating work across repositories. **Workload** shows teammates' and the Copilot coding agent's open work, unassigned issues, and activity; **Board** organizes issues and pull requests by the Status field of a shared GitHub Project. Assign work, open item details, or move Board cards without leaving the canvas.
+
+Dispatch is a user-scope extension in `~/.copilot/extensions/dispatch/`, based on [tinyclips-team-load](https://github.com/jamesmontemagno/tiny-clips/tree/main/.github/extensions/tinyclips-team-load). Choose repositories in the canvas; the team is derived from those repositories. See [TODO.md](TODO.md) for planned work and follow-ups.
 
 ![Dispatch canvas showing an example team workload, unassigned issues, and activity chart](docs/dispatch-canvas.png)
 
