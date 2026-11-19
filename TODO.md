@@ -2,7 +2,9 @@
 
 ## Next version
 
-### GitHub Projects board
+### GitHub Projects board (implemented)
+
+See the [Unreleased changelog](CHANGELOG.md#unreleased) for the Board summary.
 
 - [x] Add a kanban Board tab for tracked issues and pull requests.
 - [x] Map columns to the GitHub Project v2 single-select `Status` field and persist card moves there.
@@ -10,10 +12,16 @@
 - [x] Share one GitHub Project across tracked repos in each tracking scope.
 - [x] Infer the Project creation owner from tracked repos or ask when owners differ.
 - [x] Add open work at setup and on refresh; hide untracked work without removing it from GitHub.
+- [x] Support drag-and-drop and keyboard-accessible status moves; open card details in the canvas.
+- [x] Keep closed and merged cards in their Project status and show a badge.
 - [x] Display the Project's existing Iteration field without managing sprints.
 - [x] Document and validate the required `project` token scope (`gh auth refresh -s project`).
 - [x] Add optional, non-blocking WIP limits per status column.
 - [x] Show time in status from GitHub's Project timeline, with a configurable highlight threshold.
+
+### Board follow-up
+
+- [ ] Verify Project setup, open-work sync, and status moves against a live GitHub Project using a token with write `project` scope.
 
 ### Attention queue
 
