@@ -4,7 +4,14 @@
 
 ### Changed
 
-- Renamed the canvas from **Team load** to **Dispatch**, including the canvas ID (`dispatch`), the extension folder (`~/.copilot/extensions/dispatch`) and the repository (`soderlind/copilot-dispatch-canvas`). Existing `team-load-tracking` files are still read.
+- Renamed the canvas from **Team load** to **Dispatch**: the display name, the canvas ID (`dispatch`), the extension folder (`~/.copilot/extensions/dispatch`) and the repository (`soderlind/copilot-dispatch-canvas`).
+- Renamed internal identifiers to match: `DispatchError`, the `dispatch_error` code, the `x-dispatch-nonce` header, local storage keys and the drag data type.
+- Tracking files are now saved in the `dispatch-tracking` format. Files in the old `team-load-tracking` format still load and are rewritten in the new format on the next save.
+
+### Migration
+
+- If you cloned the old repository, run `git remote set-url origin https://github.com/soderlind/copilot-dispatch-canvas.git` (GitHub also redirects the old URL).
+- Move `~/.copilot/extensions/team-load` to `~/.copilot/extensions/dispatch` to keep your saved tracking, then reload extensions and open the `dispatch` canvas.
 
 ### Added
 
