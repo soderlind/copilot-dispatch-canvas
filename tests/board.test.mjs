@@ -18,8 +18,16 @@ const card = (id, repo, state = "OPEN", type = "Issue") => ({
     id: `item-${id}`, createdAt, project, status: { optionId: "todo", updatedAt: movedAt },
     content: { id, number: 1, title: id, state, __typename: type, repository: { nameWithOwner: repo } },
 });
+async function settledBoard(board) {
+    for (let attempt = 0; attempt < 100; attempt++) {
+        const value = board.cached();
+        if (value && !value.syncing) return value;
+        await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    throw new Error("Board background sync did not finish.");
+}
 
-function fixture() {
+function fixture(openWork = null) {
     let current = { repos: ["a/repo", "b/repo"] };
     const calls = [];
     const candidates = { projects: [project, { ...project, id: "other-project" }], owners: [{ id: "a", canCreate: true }, { id: "b", canCreate: true }] };
@@ -39,7 +47,7 @@ function fixture() {
     };
     const board = createBoard({
         github, tracking: async () => current, save: async board => { current = { ...current, board }; },
-        openWork: async repos => ({ warnings: [], items: work.filter(item => repos.includes(item.repository)) }),
+        openWork: openWork ?? (async repos => ({ warnings: [], items: work.filter(item => repos.includes(item.repository)) })),
     });
     return { board, github, candidates, items, work, calls, setRepos: repos => { current = { ...current, repos }; } };
 }
@@ -73,18 +81,80 @@ test("Board seeds open work, syncs new work, preserves closed cards and never re
     const { board, items, work, calls, setRepos } = fixture();
     await board.connect({ projectId: "project" });
     const first = await board.refresh();
-    assert.deepEqual(first.cards.map(c => [c.id, c.state, c.option, c.iteration, c.since]), [
-        ["item-existing", "OPEN", "todo", null, movedAt],
-        ["item-closed", "CLOSED", "todo", null, null],
-        ["item-merged", "MERGED", "todo", "Cycle 1", null],
-        ["item-new", "OPEN", "todo", null, null],
+    assert.equal(first.syncing, true);
+    const settled = await settledBoard(board);
+    assert.deepEqual(first.cards.map(c => [c.id, c.state, c.option, c.iteration]), [
+        ["item-existing", "OPEN", "todo", null],
+        ["item-closed", "CLOSED", "todo", null],
+        ["item-merged", "MERGED", "todo", "Cycle 1"],
+    ]);
+    await new Promise(setImmediate);
+    assert.deepEqual(settled.cards.map(c => [c.id, c.since, c.statusPending]), [
+        ["item-existing", movedAt, false],
+        ["item-closed", null, false],
+        ["item-merged", null, false],
+        ["item-new", null, false],
     ]);
     work.push({ repository: "a/repo", nodeId: "later" });
     await board.refresh({ force: true });
+    await settledBoard(board);
     setRepos(["a/repo"]);
     assert.deepEqual((await board.refresh()).cards.map(c => c.id), ["item-existing", "item-closed", "item-later"]);
     assert.ok(items.some(c => c.id === "item-merged") && items.some(c => c.id === "item-new"));
     assert.deepEqual(calls, [["add", "project", "new"], ["add", "project", "later"]]);
+});
+
+test("Board returns cards before timeline history and does not queue status moves behind history", async () => {
+    const { board, github, work } = fixture();
+    work.length = 0;
+    let finishHistory;
+    github.statusSince = () => new Promise(resolve => { finishHistory = resolve; });
+    await board.connect({ projectId: "project" });
+    const result = await board.refresh();
+    assert.equal(result.cards.find(c => c.id === "item-existing").statusPending, true);
+    await new Promise(setImmediate);
+    assert.equal(typeof finishHistory, "function");
+    await board.move({ projectId: "project", itemId: "item-existing", optionId: "done" });
+    assert.equal(board.cached(), null);
+    finishHistory(movedAt);
+    await new Promise(setImmediate);
+});
+
+test("Board status-history requests stay within the background concurrency limit", async () => {
+    const { board, github, items, work } = fixture();
+    work.length = 0;
+    for (let index = 0; index < 8; index++) items.push(card(`extra-${index}`, "a/repo"));
+    let active = 0;
+    let peak = 0;
+    const resolvers = [];
+    github.statusSince = () => {
+        active++;
+        peak = Math.max(peak, active);
+        return new Promise(resolve => resolvers.push(value => { active--; resolve(value); }));
+    };
+    await board.connect({ projectId: "project" });
+    const snapshot = await board.refresh();
+    assert.equal(snapshot.cards.length, 11);
+    await new Promise(setImmediate);
+    assert.equal(peak, 2);
+    while (board.cached().cards.some(card => card.statusPending)) {
+        resolvers.splice(0).forEach(resolve => resolve(null));
+        await new Promise(setImmediate);
+    }
+    assert.equal(peak, 2);
+});
+
+test("Board renders existing Project cards without waiting for tracked-repository synchronization", async () => {
+    let finishWork;
+    const { board } = fixture(() => new Promise(resolve => { finishWork = resolve; }));
+    await board.connect({ projectId: "project" });
+    const initial = await board.refresh();
+    assert.deepEqual(initial.cards.map(card => card.id), ["item-existing", "item-closed", "item-merged"]);
+    assert.equal(initial.syncing, true);
+    await new Promise(setImmediate);
+    assert.equal(typeof finishWork, "function");
+    finishWork({ warnings: [], items: [] });
+    await settledBoard(board);
 });
 
 test("status moves are scoped to current Project, item and option and do not enforce WIP limits", async () => {
@@ -182,14 +252,14 @@ test("Board renderer shows a soft WIP warning, badges, and the same issue detail
     const content = element();
     const { board } = fixture();
     await board.connect({ projectId: "project" });
-    await board.configure({ projectId: "project", highlightDays: 7, limits: { todo: 2 } });
+    await board.configure({ projectId: "project", highlightDays: 7, limits: { todo: 1 } });
     const panel = createBoardPanel({
         host: element(), content, errorElement: element(), announcement: element(),
         post: () => board.refresh(), context: () => ({ boardProjectId: "project", tracking: { repos: ["a/repo", "b/repo"] } }),
         esc: String, hashFor: key => `#item/${key.replace("#", "/")}`,
     });
     await panel.sync();
-    assert.match(content.innerHTML, /WIP 2\/2 · limit reached/);
+    assert.match(content.innerHTML, /WIP 1\/1 · limit reached/);
     assert.match(content.innerHTML, /data-item="a\/repo#1" href="#item\/a\/repo\/1"/);
     assert.match(content.innerHTML, />Merged</);
     assert.match(content.innerHTML, />Closed</);
@@ -231,16 +301,27 @@ test("linked Board adds newly fetched open work when the hub refreshes, even on 
             method: "POST", headers: { "content-type": "application/json", "x-dispatch-nonce": nonce },
             body: JSON.stringify({ action, input }),
         });
-        const read = async () => {
-            const response = await post("get_board");
+        const read = async (force = false) => {
+            const response = await post("get_board", { force });
             assert.equal(response.status, 200);
-            return (await response.json()).cards.map(c => c.title);
+            return response.json();
         };
         assert.equal((await post("refresh", { force: true })).status, 200);
-        assert.deepEqual(await read(), ["first"]);
+        assert.equal((await read(true)).syncing, true);
+        const waitForSyncedTitles = async () => {
+            for (let attempt = 0; attempt < 100; attempt++) {
+                const response = await post("get_board_ages");
+                const value = await response.json();
+                if (value && !value.syncing) return value.cards.map(c => c.title);
+                await new Promise(resolve => setTimeout(resolve, 5));
+            }
+            throw new Error("Board background sync did not finish.");
+        };
+        assert.deepEqual(await waitForSyncedTitles(), ["first"]);
         nodeId = "second";
         assert.equal((await post("refresh", { force: true })).status, 200);
-        assert.deepEqual(await read(), ["first", "second"]);
+        await read(true);
+        assert.deepEqual(await waitForSyncedTitles(), ["first", "second"]);
         assert.deepEqual(added, ["first", "second"]);
     } finally { await server.close(); }
 });

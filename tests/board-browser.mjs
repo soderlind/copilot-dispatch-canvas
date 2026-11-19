@@ -18,15 +18,15 @@ const connection = (...nodes) => ({ nodes, pageInfo: { hasNextPage: false, hasPr
 function fixture() {
     let tracking = { repos: [repo], knownRepos: [], hidden: [] };
     const store = { read: async () => tracking, write: async next => (tracking = next) };
-    const issue = {
+    const issues = [{
         __typename: "Issue", id: "issue", nodeId: "issue", repository: { nameWithOwner: repo },
         number: 1, title, state: "OPEN",
-    };
+    }];
     const mutations = [];
-    let item;
+    const items = [];
     const github = {
         gh: async () => "HTTP/2 200 OK\nX-OAuth-Scopes: project, repo\n\n{}",
-        fetchRepo: async () => [{ ...issue, repository: repo, kind: "issue", assignees: [], reviewers: [], labels: [], updatedAt: date }],
+        fetchRepo: async () => issues.map(issue => ({ ...issue, repository: repo, kind: "issue", assignees: [], reviewers: [], labels: [], updatedAt: date })),
         repoInfo: async () => ({ nameWithOwner: repo, open: 1 }),
         viewerRepos: async () => [],
         me: async () => "octo",
@@ -46,26 +46,29 @@ function fixture() {
             }
             if (query.includes("addProjectV2ItemById")) {
                 mutations.push(["add", values]);
-                item = { id: "card", createdAt: date, status: { id: "status", optionId: "todo", updatedAt: date }, project, content: issue };
-                return { addProjectV2ItemById: { item } };
+                const content = issues.find(issue => issue.id === values.content);
+                const added = { id: content.id === "issue" ? "card" : `card-${content.id}`, createdAt: date, status: { id: "status", optionId: "todo", updatedAt: date }, project, content };
+                items.push(added);
+                return { addProjectV2ItemById: { item: added } };
             }
             if (query.includes("updateProjectV2ItemFieldValue")) {
                 mutations.push(["move", values]);
-                item.status = { ...item.status, optionId: values.option };
-                return { updateProjectV2ItemFieldValue: { projectV2Item: item } };
+                const moved = items.find(candidate => candidate.id === values.item);
+                moved.status = { ...moved.status, optionId: values.option };
+                return { updateProjectV2ItemFieldValue: { projectV2Item: moved } };
             }
             if (query.includes("timelineItems")) return { node: { timelineItems: connection() } };
-            if (query.includes("items(first")) return { node: { items: connection(...(item ? [item] : [])) } };
-            if (query.includes("... on ProjectV2Item{")) return { node: item };
+            if (query.includes("items(first")) return { node: { items: connection(...items) } };
+            if (query.includes("... on ProjectV2Item{")) return { node: items.find(candidate => candidate.id === values.id) };
             if (query.includes("... on ProjectV2{")) return { node: project };
             throw new Error(`Unexpected stub query: ${query}`);
         },
     };
-    return { hub: createHub({ store, github }), mutations };
+    return { hub: createHub({ store, github }), mutations, issues };
 }
 
 test("Board browser: tabs, confirmed creation, populated columns, status move and details/back", { timeout: 20_000 }, async () => {
-    const { hub, mutations } = fixture();
+    const { hub, mutations, issues } = fixture();
     const server = await startServer(() => ({ hub }));
     try {
         const browser = await chromium.launch({ channel: process.env.PLAYWRIGHT_CHROME_CHANNEL });
@@ -106,6 +109,29 @@ test("Board browser: tabs, confirmed creation, populated columns, status move an
             const cardIn = column => column.getByRole("link", { name: title, exact: true });
             await expectVisible(cardIn(todo));
             await expectVisible(done);
+            await page.getByText("Board settings", { exact: true }).click();
+            const wipLimit = page.getByLabel("Todo WIP limit");
+            await wipLimit.fill("9");
+            await wipLimit.focus();
+            issues.push({
+                __typename: "Issue", id: "issue-2", nodeId: "issue-2", repository: { nameWithOwner: repo },
+                number: 2, title: "New VMF item", state: "OPEN",
+            });
+            const boardRefresh = page.waitForResponse(response => {
+                if (!response.url().endsWith("/api/action")) return false;
+                try { return JSON.parse(response.request().postData()).action === "get_board"; } catch { return false; }
+            });
+            await page.evaluate(() => {
+                const active = document.activeElement;
+                document.getElementById("refresh").click();
+                active.focus();
+            });
+            await boardRefresh;
+            await expectVisible(wipLimit);
+            assert.equal(await wipLimit.inputValue(), "9");
+            assert.equal(await wipLimit.evaluate(el => document.activeElement === el), true);
+            await cardIn(todo).focus();
+            await page.getByRole("link", { name: "New VMF item", exact: true }).waitFor({ state: "visible", timeout: 3000 });
             await todo.getByRole("combobox", { name: `Move ${repo}#1 to Status` }).selectOption({ label: "Done" });
             await expectVisible(cardIn(done));
             await cardIn(done).click();
@@ -119,6 +145,7 @@ test("Board browser: tabs, confirmed creation, populated columns, status move an
             assert.deepEqual(mutations, [
                 ["create", { owner: "owner", title: "Dispatch" }],
                 ["add", { project: "p-team", content: "issue" }],
+                ["add", { project: "p-team", content: "issue-2" }],
                 ["move", { project: "p-team", item: "card", field: "field", option: "done" }],
             ]);
             assert.deepEqual(errors, []);

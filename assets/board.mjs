@@ -15,6 +15,8 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
     let auth = null;          // { status: "starting"|"waiting"|"done"|"failed", code?, url?, error? }
     let authTimer = null;
     let writing = false;
+    let deferredRender = false;
+    let ageTimer = null;
     const currentKey = () => {
         const state = context();
         return state && JSON.stringify([state.boardProjectId, state.tracking.repos.map(repo => repo.toLowerCase())]);
@@ -60,7 +62,7 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
           <a data-item="${esc(item)}" href="${esc(hashFor(item))}">${esc(card.title)}</a>
           <div class="board-card-meta">${badge ? `<span class="board-badge">${badge}</span>` : ""}${card.archived ? '<span class="board-badge">Archived</span>' : ""}
             ${card.iteration ? `<span class="board-badge">Iteration: ${esc(card.iteration)}</span>` : ""}
-            <span class="${age.highlighted ? "board-warning" : "dim"}">${esc(age.text)}</span></div>
+            <span class="${age.highlighted ? "board-warning" : "dim"}">${card.statusPending ? "Checking status history…" : esc(age.text)}</span></div>
           ${card.archived ? "" : `<select data-move aria-label="Move ${esc(item)} to Status">
             <option value="">Move to…</option>${opts(data.options.filter(o => o.id !== card.option).map(o => [o.id, o.name]))}
           </select>`}
@@ -76,6 +78,7 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
           <h2>${esc(project.title)}</h2>
           ${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open on GitHub</a>` : ""}
         </header>
+        ${data.syncing ? '<p class="notice" role="status">Syncing open issues and pull requests from tracked repositories…</p>' : ""}
         ${warnings.length ? `<div class="notice" role="status">${warnings.map(esc).join("<br>")}</div>` : ""}
         <div class="board-columns" tabindex="0" aria-label="Status columns">${columns.map(({ id, name }) => {
             const here = cards.filter(card => (card.option ?? "") === id);
@@ -159,6 +162,47 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
         if (settingsOpen && content.querySelector(".board-settings")) content.querySelector(".board-settings").open = true;
     }
 
+    function updateData(next) {
+        const changed = !data || JSON.stringify(data) !== JSON.stringify(next);
+        data = next;
+        authNeeded = false;
+        error(null);
+        const focused = content.querySelector("form input:focus, form select:focus, .board-card :focus");
+        if (changed && focused) {
+            if (focused.closest("form")) deferredRender = true;
+        } else if (changed) {
+            deferredRender = false;
+            render();
+        }
+        scheduleAgePoll();
+    }
+
+    function scheduleAgePoll() {
+        clearTimeout(ageTimer);
+        if (host.hidden || !(data?.syncing || data?.cards?.some(card => card.statusPending))) return;
+        ageTimer = setTimeout(async () => {
+            if (host.hidden) return;
+            try {
+                const next = await post("get_board_ages");
+                if (!next || key !== currentKey() || next.project?.id !== data?.project?.id) return;
+                updateData(next);
+            } catch (failure) {
+                error(`Could not refresh Board status ages: ${failure.message}`);
+            }
+        }, 1500);
+    }
+
+    host.addEventListener("focusout", event => {
+        const form = event.target.closest("form");
+        if (!form) return;
+        queueMicrotask(() => {
+            if (deferredRender && !form.contains(document.activeElement)) {
+                deferredRender = false;
+                render();
+            }
+        });
+    });
+
     async function sync({ force = false } = {}) {
         const nextKey = currentKey();
         if (!nextKey || host.hidden || writing) return;
@@ -175,11 +219,7 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
             try {
                 const next = await post("get_board", { force });
                 if (token !== version || nextKey !== currentKey()) return;
-                const changed = !data || JSON.stringify(data) !== JSON.stringify(next);
-                data = next;
-                authNeeded = false;
-                error(null);
-                if (changed || !content.querySelector("form input:focus, form select:focus, .board-card :focus")) render();
+                updateData(next);
             } catch (failure) {
                 if (token !== version || nextKey !== currentKey()) return;
                 data = null;

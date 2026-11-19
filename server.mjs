@@ -38,6 +38,7 @@ export async function perform(context, name, input = {}) {
             }
             return hub.board.refresh(input);
         }
+        case "get_board_ages": empty(input, "get_board_ages"); return hub.board.cached();
         case "connect_board": {
             await hub.board.connect(input);
             return hub.refresh();
