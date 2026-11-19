@@ -5,7 +5,7 @@ export function renderHtml(nonce, theme = null) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="team-load-nonce" content="${nonce}">
+<meta name="dispatch-nonce" content="${nonce}">
 <meta name="referrer" content="no-referrer">
 <title>Dispatch</title>
 <link rel="icon" href="data:,">

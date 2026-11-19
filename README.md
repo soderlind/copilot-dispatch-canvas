@@ -1,6 +1,6 @@
 # Dispatch canvas
 
-A Copilot app canvas (`team-load`) that shows what each teammate and the Copilot coding agent is working on, so you can hand out new work to whoever has room. It is a user-scope extension in `~/.copilot/extensions/team-load/`, based on [tinyclips-team-load](https://github.com/jamesmontemagno/tiny-clips/tree/main/.github/extensions/tinyclips-team-load). There is no `config.json`: you choose repos in the canvas, and the people come from those repos.
+A Copilot app canvas (`dispatch`) that shows what each teammate and the Copilot coding agent is working on, so you can hand out new work to whoever has room. It is a user-scope extension in `~/.copilot/extensions/dispatch/`, based on [tinyclips-team-load](https://github.com/jamesmontemagno/tiny-clips/tree/main/.github/extensions/tinyclips-team-load). There is no `config.json`: you choose repos in the canvas, and the people come from those repos.
 
 Use the sun/moon button beside Refresh to switch between light and dark themes. The canvas follows the system theme until you choose one; your choice applies to every view until the page reloads.
 
@@ -9,10 +9,10 @@ Use the sun/moon button beside Refresh to switch between light and dark themes. 
 Clone the repo as a user-scope extension, then reload extensions in the Copilot app:
 
 ```bash
-git clone https://github.com/soderlind/copilot-team-canvas ~/.copilot/extensions/team-load
+git clone https://github.com/soderlind/copilot-dispatch-canvas ~/.copilot/extensions/dispatch
 ```
 
-The folder name must be `team-load` and the entry file is `extension.mjs`. It needs the `gh` CLI, signed in (`gh auth login`). Per-user tracking is written to `artifacts/` and is git-ignored.
+The folder name must be `dispatch` and the entry file is `extension.mjs`. It needs the `gh` CLI, signed in (`gh auth login`). Per-user tracking is written to `artifacts/` and is git-ignored.
 
 ## What it shows
 
@@ -76,7 +76,7 @@ Open the **Tracking** panel from the people · repos button in the header.
 
 Agents can do the same with `set_tracking`: `{ "repos": ["owner/name", "owner/prefix*"], "hidden": ["login"] }`. Either list may be omitted to keep it as is.
 
-Tracking is saved to `$COPILOT_HOME/extensions/team-load/artifacts/tracking.json` (default `~/.copilot/...`). It also accepts two optional hand-edited settings, which are kept across saves:
+Tracking is saved to `$COPILOT_HOME/extensions/dispatch/artifacts/tracking.json` (default `~/.copilot/...`). It also accepts two optional hand-edited settings, which are kept across saves:
 
 - `limit`: the load-meter limit, 1-20. Default 6.
 - `refreshSeconds`: the auto-refresh interval, at least 60. Default 300.
@@ -100,7 +100,7 @@ The canvas is served from a loopback server with a per-launch nonce, a host/orig
 ## Development
 
 ```bash
-cd ~/.copilot/extensions/team-load && node --test tests/
+cd ~/.copilot/extensions/dispatch && node --test tests/
 ```
 
 Tests mock `gh`; they never touch GitHub. Client request-state tests use minimal DOM fixtures and deferred responses to cover bulk controls, navigation during edits, label Undo, Momentum selection changes, tracking races, and same-selection stale-data fallback without browser dependencies. Project detection is tested against fixture `events.jsonl` files.

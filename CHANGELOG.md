@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Renamed the canvas from **Team load** to **Dispatch**. The canvas ID (`team-load`), extension folder and saved tracking data are unchanged.
+- Renamed the canvas from **Team load** to **Dispatch**, including the canvas ID (`dispatch`), the extension folder (`~/.copilot/extensions/dispatch`) and the repository (`soderlind/copilot-dispatch-canvas`). Existing `team-load-tracking` files are still read.
 
 ### Added
 

@@ -6,7 +6,7 @@ import { createBoardPanel } from "/board.mjs";
 
 const $ = id => document.getElementById(id);
 const root = document.documentElement;
-const nonce = document.querySelector('meta[name="team-load-nonce"]').content;
+const nonce = document.querySelector('meta[name="dispatch-nonce"]').content;
 const icon = (name, cls = "") => `<svg class="octicon ${cls}" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const keyOf = item => `${item.repository}#${item.number}`;
@@ -31,7 +31,7 @@ media.addEventListener("change", () => { applyTheme(); paintLabels(document); })
 async function post(action, input = {}) {
     const response = await fetch("/api/action", {
         method: "POST",
-        headers: { "content-type": "application/json", "x-team-load-nonce": nonce },
+        headers: { "content-type": "application/json", "x-dispatch-nonce": nonce },
         body: JSON.stringify({ action, input }),
     });
     const body = await response.json().catch(() => ({}));
@@ -66,10 +66,10 @@ const STARTING_TTL = 15 * 60e3;
 const selected = new Set();
 let bulkBusy = false;
 const starting = (() => {
-    try { return new Map(Object.entries(JSON.parse(localStorage.getItem("team-load-starting") ?? "{}")).filter(([, t]) => Date.now() - t < STARTING_TTL)); }
+    try { return new Map(Object.entries(JSON.parse(localStorage.getItem("dispatch-starting") ?? "{}")).filter(([, t]) => Date.now() - t < STARTING_TTL)); }
     catch { return new Map(); }
 })();
-const saveStarting = () => { try { localStorage.setItem("team-load-starting", JSON.stringify(Object.fromEntries(starting))); } catch {} };
+const saveStarting = () => { try { localStorage.setItem("dispatch-starting", JSON.stringify(Object.fromEntries(starting))); } catch {} };
 const isStarting = key => Date.now() - (starting.get(key) ?? 0) < STARTING_TTL;
 // Replaces the row's issue icon so the status costs no width.
 const startingIcon = () => `<span class="starting" role="img" aria-label="Copilot session starting" title="Copilot session starting">${icon("copilot")}</span>`;
@@ -751,7 +751,7 @@ $("roster").addEventListener("dragstart", event => {
     const link = event.target.closest("[data-move-key]");
     if (!beginMove(link)) { event.preventDefault(); return; }
     event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("application/x-team-load-issue", movingIssue.key);
+    event.dataTransfer.setData("application/x-dispatch-issue", movingIssue.key);
 });
 $("roster").addEventListener("dragover", event => {
     if (!movingIssue || movingIssue.keyboard) return;

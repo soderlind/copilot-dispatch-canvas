@@ -9,7 +9,7 @@ import { createBoard } from "../board.mjs";
 import { createHub } from "../hub.mjs";
 import { startServer } from "../server.mjs";
 import { createTrackingStore } from "../state.mjs";
-import { TeamLoadError } from "../model.mjs";
+import { DispatchError } from "../model.mjs";
 
 const createdAt = "2026-01-01T10:00:00Z";
 const movedAt = "2026-01-02T10:00:00Z";
@@ -60,7 +60,7 @@ test("organization creation is attempted only with confirmation and exposes GitH
     let attempts = 0;
     github.create = async () => {
         attempts++;
-        throw new TeamLoadError("permission_denied", "GitHub refused the mutation.");
+        throw new DispatchError("permission_denied", "GitHub refused the mutation.");
     };
     await assert.rejects(board.connect({ ownerId: "b", title: "Board" }), /Explicitly confirm/);
     assert.equal(attempts, 0);
@@ -108,7 +108,7 @@ test("status moves are scoped to current Project, item and option and do not enf
 });
 
 test("Board settings persist separately across global and Copilot Project tracking writes", async () => {
-    const home = await mkdtemp(join(tmpdir(), "team-load-board-"));
+    const home = await mkdtemp(join(tmpdir(), "dispatch-board-"));
     try {
         const global = createTrackingStore(home);
         const local = createTrackingStore(home, { project: "scope-a" });
@@ -224,11 +224,11 @@ test("linked Board adds newly fetched open work when the hub refreshes, even on 
     const server = await startServer(() => ({ hub }));
     try {
         const html = await (await fetch(server.url)).text();
-        const [, nonce] = /name="team-load-nonce" content="([^"]+)"/.exec(html);
+        const [, nonce] = /name="dispatch-nonce" content="([^"]+)"/.exec(html);
         assert.match(html, /id="board-tab"/);
         assert.equal((await fetch(new URL("board.mjs", server.url))).status, 200);
         const post = (action, input = {}) => fetch(new URL("api/action", server.url), {
-            method: "POST", headers: { "content-type": "application/json", "x-team-load-nonce": nonce },
+            method: "POST", headers: { "content-type": "application/json", "x-dispatch-nonce": nonce },
             body: JSON.stringify({ action, input }),
         });
         const read = async () => {

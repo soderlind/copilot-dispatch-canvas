@@ -1,5 +1,5 @@
 import { createCanvas, CanvasError, joinSession } from "@github/copilot-sdk/extension";
-import { TeamLoadError } from "./model.mjs";
+import { DispatchError } from "./model.mjs";
 import { createTrackingStore } from "./state.mjs";
 import { createGitHub } from "./github.mjs";
 import { createHub } from "./hub.mjs";
@@ -60,7 +60,7 @@ function handled(handler) {
         try { return await handler(ctx); }
         catch (error) {
             log(error.message);
-            throw new CanvasError(error instanceof TeamLoadError ? error.code : "team_load_error", error.message);
+            throw new CanvasError(error instanceof DispatchError ? error.code : "dispatch_error", error.message);
         }
     };
 }
@@ -73,7 +73,7 @@ const action = (name, description, inputSchema) => ({
 
 session = await joinSession({
     canvases: [createCanvas({
-        id: "team-load",
+        id: "dispatch",
         displayName: "Dispatch",
         description: "See what everyone in your tracked GitHub repos (and Copilot) is working on, how active the team has been, and assign or reassign issues to whoever has capacity.",
         actions: [

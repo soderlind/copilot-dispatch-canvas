@@ -1,7 +1,7 @@
-import { TeamLoadError } from "./model.mjs";
+import { DispatchError } from "./model.mjs";
 
-const invalid = message => new TeamLoadError("invalid_input", message);
-const conflict = message => new TeamLoadError("conflict", message);
+const invalid = message => new DispatchError("invalid_input", message);
+const conflict = message => new DispatchError("conflict", message);
 const idPattern = /^[A-Za-z0-9_+=:/-]{1,250}$/;
 const positiveInt = (value, max) => Number.isInteger(value) && value >= 1 && value <= max;
 const trackedKeys = tracking => new Set(tracking.repos.map(repo => repo.toLowerCase()));
@@ -142,10 +142,10 @@ export function createBoard({ github, tracking, save, openWork, now = Date.now, 
             try { created = await github.create(owner.id, input.title.trim()); }
             catch (error) {
                 if (error.code !== "permission_denied" || owner.canCreate !== null) throw error;
-                throw new TeamLoadError(error.code, `GitHub denied Project creation for ${owner.login}. Ask an organization owner to check its Project creation policy, or link a Project they create for you. ${error.message}`);
+                throw new DispatchError(error.code, `GitHub denied Project creation for ${owner.login}. Ask an organization owner to check its Project creation policy, or link a Project they create for you. ${error.message}`);
             }
             projectId = created?.id;
-            if (!projectId) throw new TeamLoadError("github_error", "GitHub did not confirm creation. Check the owner's Projects before retrying.");
+            if (!projectId) throw new DispatchError("github_error", "GitHub did not confirm creation. Check the owner's Projects before retrying.");
         } else {
             projectId = setup.projects.find(project => project.id === input.projectId)?.id;
             if (!projectId) throw conflict("That Project is not an editable candidate for this tracking scope.");

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { AGENT, TeamLoadError, canonLogin, momentumStart, repoPattern } from "./model.mjs";
+import { AGENT, DispatchError, canonLogin, momentumStart, repoPattern } from "./model.mjs";
 import { extensionRoot } from "./state.mjs";
 
 const exec = promisify(execFile);
@@ -25,8 +25,8 @@ export async function runGh(args, { json = true, input = null, storedLogin = fal
         const result = await pending;
         return json ? JSON.parse(result.stdout) : result.stdout;
     } catch (error) {
-        if (error.code === "ENOENT") throw new TeamLoadError("missing_gh", "GitHub CLI (gh) is not installed or is not on PATH.");
-        if (error instanceof SyntaxError) throw new TeamLoadError("github_error", "GitHub returned a response that was not JSON.");
+        if (error.code === "ENOENT") throw new DispatchError("missing_gh", "GitHub CLI (gh) is not installed or is not on PATH.");
+        if (error instanceof SyntaxError) throw new DispatchError("github_error", "GitHub returned a response that was not JSON.");
         const message = redact(error.stderr || error.message);
         if (/rate limit|RATE_LIMITED/i.test(message)) {
             let retryAt = new Date(Date.now() + 300_000).toISOString();
@@ -35,10 +35,10 @@ export async function runGh(args, { json = true, input = null, storedLogin = fal
                 const exhausted = Object.values(JSON.parse(result.stdout).resources).filter(value => value.remaining === 0);
                 if (exhausted.length) retryAt = new Date(Math.max(...exhausted.map(value => value.reset)) * 1000).toISOString();
             } catch { /* keep the default retry time */ }
-            throw new TeamLoadError("rate_limit", `GitHub rate limit reached. ${message}`, retryAt);
+            throw new DispatchError("rate_limit", `GitHub rate limit reached. ${message}`, retryAt);
         }
-        if (/HTTP 404|Could not resolve to a|not found/i.test(message)) throw new TeamLoadError("not_found", `GitHub could not find that. ${message}`);
-        throw new TeamLoadError(/auth|HTTP 401|HTTP 403|permission|scope|not have permission/i.test(message) ? "permission_denied" : "github_error",
+        if (/HTTP 404|Could not resolve to a|not found/i.test(message)) throw new DispatchError("not_found", `GitHub could not find that. ${message}`);
+        throw new DispatchError(/auth|HTTP 401|HTTP 403|permission|scope|not have permission/i.test(message) ? "permission_denied" : "github_error",
             `GitHub request failed. ${message}`);
     }
 }
@@ -98,7 +98,7 @@ const historyIssuesQuery = `query($owner:String!,$name:String!,$after:String){re
   }}}`;
 
 const split = nwo => {
-    if (!repoPattern.test(nwo)) throw new TeamLoadError("invalid_input", "Repository must look like owner/name.");
+    if (!repoPattern.test(nwo)) throw new DispatchError("invalid_input", "Repository must look like owner/name.");
     return nwo.split("/");
 };
 const labels = connection => (connection?.nodes ?? []).map(label => ({ name: String(label.name), color: /^[0-9a-f]{6}$/i.test(label.color) ? label.color : "8c959f" }));
@@ -170,9 +170,9 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         const response = await limited(args);
         if (response?.errors?.length) {
             const message = response.errors.map(error => error.message).join("; ");
-            throw new TeamLoadError(response.errors.some(error => error.type === "NOT_FOUND") ? "not_found" : "github_error", message);
+            throw new DispatchError(response.errors.some(error => error.type === "NOT_FOUND") ? "not_found" : "github_error", message);
         }
-        if (!response?.data) throw new TeamLoadError("github_error", "GitHub returned no data.");
+        if (!response?.data) throw new DispatchError("github_error", "GitHub returned no data.");
         return response.data;
     }
 
@@ -183,13 +183,13 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         for (let page = 0; page < PAGE_LIMIT; page++) {
             const data = await gql(query, { owner, name, after });
             const connection = data.repository?.[field];
-            if (!connection) throw new TeamLoadError("not_found", `${nwo} is not available.`);
+            if (!connection) throw new DispatchError("not_found", `${nwo} is not available.`);
             items.push(...connection.nodes.filter(Boolean).map(node => normalize(node, nwo)));
             if (!connection.pageInfo.hasNextPage) return items;
             after = connection.pageInfo.endCursor;
         }
         const description = field === "labels" ? "labels" : `open ${field}`;
-        throw new TeamLoadError("coverage_limit", `${nwo} has more than ${PAGE_LIMIT * 100} ${description}; results would be incomplete.`);
+        throw new DispatchError("coverage_limit", `${nwo} has more than ${PAGE_LIMIT * 100} ${description}; results would be incomplete.`);
     }
 
     async function fetchRepo(nwo) {
@@ -209,7 +209,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         for (let page = 0; page < PAGE_LIMIT; page++) {
             const data = await gql(query, { owner, name, after });
             const connection = data.repository?.[field];
-            if (!connection) throw new TeamLoadError("not_found", `${nwo} is not available.`);
+            if (!connection) throw new DispatchError("not_found", `${nwo} is not available.`);
             const batch = connection.nodes.filter(Boolean);
             nodes.push(...batch.filter(node => Date.parse(node.updatedAt) >= since));
             const last = batch.at(-1);
@@ -225,7 +225,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         let after;
         for (let page = 0; page < PAGE_LIMIT; page++) {
             const data = await gql(historyCommitsQuery, { owner, name, since: new Date(since).toISOString(), after });
-            if (!data.repository) throw new TeamLoadError("not_found", `${nwo} is not available.`);
+            if (!data.repository) throw new DispatchError("not_found", `${nwo} is not available.`);
             const connection = data.repository.defaultBranchRef?.target?.history;
             if (!connection) return { nodes, truncated: false };
             nodes.push(...connection.nodes.filter(Boolean));
@@ -260,7 +260,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         const [owner, name] = split(nwo);
         const data = await gql(infoQuery, { owner, name });
         const repo = data.repository;
-        if (!repo) throw new TeamLoadError("not_found", `${nwo} was not found or you lack access.`);
+        if (!repo) throw new DispatchError("not_found", `${nwo} was not found or you lack access.`);
         const value = {
             nameWithOwner: repo.nameWithOwner, url: repo.url,
             open: (repo.openIssues?.totalCount ?? 0) + (repo.openPulls?.totalCount ?? 0),
@@ -291,12 +291,12 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         for (let page = 0; page < PAGE_LIMIT; page++) {
             const data = await gql(ownerReposQuery, { owner, after });
             const connection = data.repositoryOwner?.repositories;
-            if (!connection) throw new TeamLoadError("not_found", `${owner} was not found or you lack access.`);
+            if (!connection) throw new DispatchError("not_found", `${owner} was not found or you lack access.`);
             names.push(...connection.nodes.filter(Boolean).map(node => node.nameWithOwner));
             if (!connection.pageInfo.hasNextPage) return names;
             after = connection.pageInfo.endCursor;
         }
-        throw new TeamLoadError("coverage_limit", `${owner} has more than ${PAGE_LIMIT * 100} repositories; use exact owner/name entries instead.`);
+        throw new DispatchError("coverage_limit", `${owner} has more than ${PAGE_LIMIT * 100} repositories; use exact owner/name entries instead.`);
     }
 
     function remember(person) {
@@ -314,7 +314,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         if (profileRequests.has(key)) return profileRequests.get(key);
         const request = limited(["api", "--hostname", "github.com", `users/${key}`])
             .then(user => {
-                if (!user?.login || user.type === "Organization") throw new TeamLoadError("not_found", `@${key} is not a GitHub user.`);
+                if (!user?.login || user.type === "Organization") throw new DispatchError("not_found", `@${key} is not a GitHub user.`);
                 const value = { login: user.login, name: user.name || null, avatarUrl: user.avatar_url || null };
                 profiles.set(key, { at: now(), value });
                 return value;
@@ -333,7 +333,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         const [owner, name] = split(repository);
         const data = await gql(detailQuery, { owner, name, number });
         const node = data.repository?.issueOrPullRequest;
-        if (!node) throw new TeamLoadError("not_found", `${repository}#${number} was not found.`);
+        if (!node) throw new DispatchError("not_found", `${repository}#${number} was not found.`);
         const pr = node.__typename === "PullRequest";
         return {
             kind: pr ? "pr" : "issue", repository, number: node.number, title: node.title, url: node.url,
@@ -365,15 +365,15 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
     // alongside existing assignees and is a no-op when the login is already assigned.
     async function assign({ repository, number, login, additional = false, issuesOnly = false, rollbackOnFailure = false }) {
         const before = await readIssue({ repository, number });
-        if (before.isPr && issuesOnly) throw new TeamLoadError("invalid_input", `${repository}#${number} is a pull request. Sessions can only be started for issues.`);
-        if (before.isPr && (login === AGENT || !additional)) throw new TeamLoadError("invalid_input", login === AGENT ? "Copilot can only be assigned to issues." : "Only issues can be triaged from Dispatch.");
-        if (before.state !== "open") throw new TeamLoadError("conflict", `${repository}#${number} is closed.`);
+        if (before.isPr && issuesOnly) throw new DispatchError("invalid_input", `${repository}#${number} is a pull request. Sessions can only be started for issues.`);
+        if (before.isPr && (login === AGENT || !additional)) throw new DispatchError("invalid_input", login === AGENT ? "Copilot can only be assigned to issues." : "Only issues can be triaged from Dispatch.");
+        if (before.state !== "open") throw new DispatchError("conflict", `${repository}#${number} is closed.`);
         if (additional && before.assignees.includes(login)) return { assignees: before.assignees, added: false };
-        if (!additional && before.assignees.length) throw new TeamLoadError("conflict", `${repository}#${number} is already assigned to ${before.assignees.map(l => l === AGENT ? "Copilot" : `@${l}`).join(", ")}.`);
+        if (!additional && before.assignees.length) throw new DispatchError("conflict", `${repository}#${number} is already assigned to ${before.assignees.map(l => l === AGENT ? "Copilot" : `@${l}`).join(", ")}.`);
         try {
             await editAssignee({ repository, number, login, isPr: before.isPr }, "--add-assignee");
             const after = await readIssue({ repository, number });
-            if (!after.assignees.includes(login)) throw new TeamLoadError("github_error", `GitHub accepted the change but ${login === AGENT ? "Copilot" : `@${login}`} is not assigned to ${repository}#${number}. Copilot may not be enabled for this repository.`);
+            if (!after.assignees.includes(login)) throw new DispatchError("github_error", `GitHub accepted the change but ${login === AGENT ? "Copilot" : `@${login}`} is not assigned to ${repository}#${number}. Copilot may not be enabled for this repository.`);
             return { assignees: after.assignees, added: true };
         } catch (error) {
             if (!rollbackOnFailure) throw error;
@@ -381,9 +381,9 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
                 // The pre-write checks guarantee this login was not already assigned. Compensate even if the write response was lost.
                 await editAssignee({ repository, number, login, isPr: before.isPr }, "--remove-assignee");
                 const restored = await readIssue({ repository, number });
-                if (restored.assignees.includes(login)) throw new TeamLoadError("github_error", `@${login} is still assigned.`);
+                if (restored.assignees.includes(login)) throw new DispatchError("github_error", `@${login} is still assigned.`);
             } catch (cleanup) {
-                throw new TeamLoadError("write_uncertain", `Could not claim ${repository}#${number}, and undoing the claim could not be verified. @${login} may still be assigned; check it on GitHub. ${error.message} Rollback: ${cleanup.message}`);
+                throw new DispatchError("write_uncertain", `Could not claim ${repository}#${number}, and undoing the claim could not be verified. @${login} may still be assigned; check it on GitHub. ${error.message} Rollback: ${cleanup.message}`);
             }
             throw error;
         }
@@ -394,24 +394,24 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         if (!before.assignees.includes(login)) return { assignees: before.assignees };
         await editAssignee({ repository, number, login, isPr: before.isPr }, "--remove-assignee");
         const after = await readIssue({ repository, number });
-        if (after.assignees.includes(login)) throw new TeamLoadError("github_error", `Could not unassign ${login} from ${repository}#${number}.`);
+        if (after.assignees.includes(login)) throw new DispatchError("github_error", `Could not unassign ${login} from ${repository}#${number}.`);
         return { assignees: after.assignees };
     }
 
     async function reassign({ repository, number, from, login }) {
-        if (from === login) throw new TeamLoadError("invalid_input", "Choose a different assignee to move the issue to.");
+        if (from === login) throw new DispatchError("invalid_input", "Choose a different assignee to move the issue to.");
         const before = await readIssue({ repository, number });
-        if (before.isPr) throw new TeamLoadError("invalid_input", "Only issues can be moved from Dispatch.");
-        if (before.state !== "open") throw new TeamLoadError("conflict", `${repository}#${number} is closed.`);
-        if (!before.assignees.includes(from)) throw new TeamLoadError("conflict", `${repository}#${number} is no longer assigned to ${from}. Refresh before moving it.`);
+        if (before.isPr) throw new DispatchError("invalid_input", "Only issues can be moved from Dispatch.");
+        if (before.state !== "open") throw new DispatchError("conflict", `${repository}#${number} is closed.`);
+        if (!before.assignees.includes(from)) throw new DispatchError("conflict", `${repository}#${number} is no longer assigned to ${from}. Refresh before moving it.`);
         // Verify the new owner before removing the old one, so a rejected assignment never leaves the issue unowned.
         const assigned = await assign({ repository, number, login, additional: true });
         try {
             const result = await unassign({ repository, number, login: from });
-            if (!result.assignees.includes(login)) throw new TeamLoadError("github_error", `${login} is no longer assigned.`);
+            if (!result.assignees.includes(login)) throw new DispatchError("github_error", `${login} is no longer assigned.`);
             return { ...result, added: assigned.added };
         } catch (error) {
-            throw new TeamLoadError("write_uncertain", `Could not verify the move of ${repository}#${number}. ${login} was assigned, but ${from} may still be assigned too. Refresh and check the assignees before trying again. ${error.message}`);
+            throw new DispatchError("write_uncertain", `Could not verify the move of ${repository}#${number}. ${login} was assigned, but ${from} may still be assigned too. Refresh and check the assignees before trying again. ${error.message}`);
         }
     }
 
@@ -433,9 +433,9 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         const path = `repos/${repository}/issues/comments/${commentId}`;
         const existing = await limited(["api", "--hostname", "github.com", path]);
         if (!String(existing.issue_url ?? "").toLowerCase().endsWith(`/repos/${repository.toLowerCase()}/issues/${number}`)) {
-            throw new TeamLoadError("invalid_input", `That comment is not on ${repository}#${number}.`);
+            throw new DispatchError("invalid_input", `That comment is not on ${repository}#${number}.`);
         }
-        if (canonLogin(existing.user?.login) !== await me()) throw new TeamLoadError("permission_denied", "You can only delete your own comments.");
+        if (canonLogin(existing.user?.login) !== await me()) throw new DispatchError("permission_denied", "You can only delete your own comments.");
         await limited(["api", "--hostname", "github.com", "--method", "DELETE", path], { json: false });
         return { deleted: commentId };
     }
@@ -453,7 +453,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
     async function editLabel({ repository, number, label, add }) {
         const known = (await repoLabels(repository)).find(l => l.name.toLowerCase() === label.toLowerCase())
             ?? (add ? (await repoLabels(repository, { force: true })).find(l => l.name.toLowerCase() === label.toLowerCase()) : null);
-        if (add && !known) throw new TeamLoadError("invalid_input", `${repository} has no label named "${label}".`);
+        if (add && !known) throw new DispatchError("invalid_input", `${repository} has no label named "${label}".`);
         const name = known?.name ?? label;
         const before = await readIssue({ repository, number });
         const has = before.labels.some(l => l.toLowerCase() === name.toLowerCase());
@@ -462,18 +462,18 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
             else await api("DELETE", `repos/${repository}/issues/${number}/labels/${encodeURIComponent(name)}`);
         }
         const after = await readIssue({ repository, number });
-        if (after.labels.some(l => l.toLowerCase() === name.toLowerCase()) !== add) throw new TeamLoadError("github_error", `Could not ${add ? "add" : "remove"} the ${name} label.`);
+        if (after.labels.some(l => l.toLowerCase() === name.toLowerCase()) !== add) throw new DispatchError("github_error", `Could not ${add ? "add" : "remove"} the ${name} label.`);
         const colors = new Map((await repoLabels(repository)).map(l => [l.name.toLowerCase(), l.color]));
         return { labels: after.labels.map(n => ({ name: n, color: colors.get(n.toLowerCase()) ?? "8c959f" })) };
     }
 
     async function setState({ repository, number, state }) {
         const before = await readIssue({ repository, number });
-        if (before.merged) throw new TeamLoadError("conflict", `${repository}#${number} is merged.`);
+        if (before.merged) throw new DispatchError("conflict", `${repository}#${number} is merged.`);
         if (before.state !== state) {
             await limited([before.isPr ? "pr" : "issue", state === "closed" ? "close" : "reopen", String(number), "--repo", repository], { json: false });
             const after = await readIssue({ repository, number });
-            if (after.state !== state) throw new TeamLoadError("github_error", `Could not ${state === "closed" ? "close" : "reopen"} ${repository}#${number}.`);
+            if (after.state !== state) throw new DispatchError("github_error", `Could not ${state === "closed" ? "close" : "reopen"} ${repository}#${number}.`);
         }
         return { itemState: state };
     }

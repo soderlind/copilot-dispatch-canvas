@@ -1,6 +1,6 @@
 // Pure, dependency-free logic shared by the extension (Node) and the canvas page (browser).
 
-export class TeamLoadError extends Error {
+export class DispatchError extends Error {
     constructor(code, message, retryAt = null) {
         super(message);
         this.code = code;
@@ -45,7 +45,7 @@ const dedupeRepos = list => {
 
 // Tracking is the repositories to watch plus the people to hide. People themselves come from the repositories.
 export function normalizeTracking(value, { maxRepos = MAX_REPOS, maxHidden = MAX_HIDDEN } = {}) {
-    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    const fail = message => { throw new DispatchError("invalid_input", message); };
     if (!value || typeof value !== "object" || Array.isArray(value)) fail("Provide repos and hidden lists.");
     const extra = Object.keys(value).filter(key => !["repos", "hidden"].includes(key));
     if (extra.length) fail(`Unknown tracking field: ${extra[0]}.`);
@@ -61,7 +61,7 @@ export function normalizeTracking(value, { maxRepos = MAX_REPOS, maxHidden = MAX
 
 // Input to set_tracking: either list may be omitted to keep the current one, and repos may contain owner/prefix* wildcards.
 export function validateTrackingInput(value) {
-    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    const fail = message => { throw new DispatchError("invalid_input", message); };
     if (!value || typeof value !== "object" || Array.isArray(value)) fail("Provide repos and/or hidden.");
     const extra = Object.keys(value).filter(key => !["repos", "hidden"].includes(key));
     if (extra.length) fail(`Unknown tracking field: ${extra[0]}.`);
@@ -76,7 +76,7 @@ export function validateTrackingInput(value) {
 }
 
 export function validateItemRef(input, { title = false, login = false, additional = false, from = false } = {}) {
-    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    const fail = message => { throw new DispatchError("invalid_input", message); };
     if (!input || typeof input !== "object" || Array.isArray(input)) fail("Provide an item.");
     const logins = [...(login ? ["login"] : []), ...(from ? ["from"] : [])];
     const allowed = ["repository", "number", ...(title ? ["title"] : []), ...logins, ...(additional ? ["additional"] : [])];
@@ -117,7 +117,7 @@ export function labelSummary(labels, max = 2) {
 export const MAX_SESSION_BATCH = 10;
 // A bulk "start sessions" request: 1..MAX_SESSION_BATCH distinct issue refs, each { repository, number, title? }.
 export function validateSessionBatch(input) {
-    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    const fail = message => { throw new DispatchError("invalid_input", message); };
     if (!input || typeof input !== "object" || Array.isArray(input)) fail("Provide items.");
     const extra = Object.keys(input).filter(key => key !== "items");
     if (extra.length) fail(`Unknown field: ${extra[0]}.`);
@@ -135,7 +135,7 @@ export function validateSessionBatch(input) {
 export const MAX_COMMENT_LENGTH = 65536;
 // Detail-view edits: an item ref plus exactly the fields that edit needs.
 export function validateEdit(input, kind) {
-    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    const fail = message => { throw new DispatchError("invalid_input", message); };
     const fields = { comment: ["body"], delete_comment: ["commentId"], label: ["label", "add"], set_item_state: ["state"] }[kind];
     if (!fields) fail("Unknown edit.");
     if (!input || typeof input !== "object" || Array.isArray(input)) fail("Provide an item.");
@@ -178,7 +178,7 @@ export const momentumStart = (days, now = Date.now()) => Math.floor(now / DAY_MS
 
 // `person` and `everyone` are separate fields so that a GitHub login can never collide with a scope keyword.
 export function validateMomentumInput(input = {}) {
-    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    const fail = message => { throw new DispatchError("invalid_input", message); };
     if (!input || typeof input !== "object" || Array.isArray(input)) fail("Provide momentum options.");
     const extra = Object.keys(input).filter(key => !["days", "person", "everyone", "repository", "force"].includes(key));
     if (extra.length) fail(`Unknown field: ${extra[0]}.`);

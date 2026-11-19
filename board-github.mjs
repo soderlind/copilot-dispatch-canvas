@@ -1,4 +1,4 @@
-import { TeamLoadError } from "./model.mjs";
+import { DispatchError } from "./model.mjs";
 
 const pageInfo = "pageInfo{hasNextPage endCursor}";
 const projectFields = `id title url number closed template viewerCanUpdate
@@ -20,7 +20,7 @@ const timeline = `timelineItems(${events}){
 const historyQuery = `query($id:ID!,$before:String){node(id:$id){... on Issue{${timeline}} ... on PullRequest{${timeline}}}}`;
 
 const authHelp = "Board uses your stored GitHub CLI login (not GH_TOKEN or GITHUB_TOKEN) and needs its write `project` scope. Use Grant Project access below, or run `gh auth refresh -h github.com -s project`, then retry. For organization Projects, check SSO and Project write access.";
-const missingScope = () => new TeamLoadError("permission_denied", authHelp);
+const missingScope = () => new DispatchError("permission_denied", authHelp);
 export const suitableProject = project => !!(project && !project.closed && !project.template && project.viewerCanUpdate && project.status?.options?.length);
 
 export async function collectPages(read, label) {
@@ -28,12 +28,12 @@ export async function collectPages(read, label) {
     let after;
     for (let page = 0; page < 50; page++) {
         const connection = await read(after);
-        if (!connection) throw new TeamLoadError("not_found", `${label} is not available.`);
+        if (!connection) throw new DispatchError("not_found", `${label} is not available.`);
         nodes.push(...connection.nodes.filter(Boolean));
         if (!connection.pageInfo.hasNextPage) return nodes;
         after = connection.pageInfo.endCursor;
     }
-    throw new TeamLoadError("coverage_limit", `Could not read all pages of ${label}.`);
+    throw new DispatchError("coverage_limit", `Could not read all pages of ${label}.`);
 }
 
 // Use the latest event for this Project, not the latest event with a matching label
@@ -62,7 +62,7 @@ export function createBoardGitHub({ gql, gh }, now = Date.now) {
         catch (error) {
             if (error.code === "permission_denied" || /scope|resource not accessible|permission|forbidden/i.test(error.message)) {
                 authorizedAt = -Infinity;
-                throw new TeamLoadError("permission_denied", `${error.message} ${authHelp}`);
+                throw new DispatchError("permission_denied", `${error.message} ${authHelp}`);
             }
             throw error;
         }
@@ -110,7 +110,7 @@ export function createBoardGitHub({ gql, gh }, now = Date.now) {
         const { node } = await query(`query($id:ID!){node(id:$id){... on ProjectV2{${projectFields}
             fields(first:100){nodes{... on ProjectV2IterationField{id name}}}
         }}}`, { id });
-        if (!suitableProject(node)) throw new TeamLoadError("conflict", `The linked GitHub Project is closed, no longer editable, or missing a single-select Status field. Check the Project and gh account. ${authHelp}`);
+        if (!suitableProject(node)) throw new DispatchError("conflict", `The linked GitHub Project is closed, no longer editable, or missing a single-select Status field. Check the Project and gh account. ${authHelp}`);
         const iterations = node.fields?.nodes.filter(field => field?.id) ?? [];
         return { ...node, iteration: iterations.find(field => field.name === "Iteration") ?? iterations[0] };
     }
@@ -138,7 +138,7 @@ export function createBoardGitHub({ gql, gh }, now = Date.now) {
         const { addProjectV2ItemById } = await query(`mutation($project:ID!,$content:ID!){
             addProjectV2ItemById(input:{projectId:$project,contentId:$content}){item{id}}
         }`, { project, content });
-        if (!addProjectV2ItemById?.item?.id) throw new TeamLoadError("github_error", "GitHub did not confirm the item was added.");
+        if (!addProjectV2ItemById?.item?.id) throw new DispatchError("github_error", "GitHub did not confirm the item was added.");
     }
     async function move(project, item, field, option) {
         const { updateProjectV2ItemFieldValue } = await query(`mutation($project:ID!,$item:ID!,$field:ID!,$option:String!){
@@ -147,7 +147,7 @@ export function createBoardGitHub({ gql, gh }, now = Date.now) {
             }
         }`, { project, item, field, option });
         if (updateProjectV2ItemFieldValue?.projectV2Item?.status?.optionId !== option) {
-            throw new TeamLoadError("conflict", "GitHub did not confirm the new Status. Refresh the board to check the card.");
+            throw new DispatchError("conflict", "GitHub did not confirm the new Status. Refresh the board to check the card.");
         }
     }
     async function statusSince(item, name) {

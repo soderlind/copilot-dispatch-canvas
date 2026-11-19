@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInNewContext } from "node:vm";
 import {
-    AGENT, TeamLoadError, canonLogin, cleanTitle, computeLoad, loadOf, tone, meterScale, sortRoster, sortForAssign,
+    AGENT, DispatchError, canonLogin, cleanTitle, computeLoad, loadOf, tone, meterScale, sortRoster, sortForAssign,
     ago, shortRepo, parseItemUrl, loginPattern, repoPattern, planRowUpdate, normalizeTracking, validateTrackingInput, isRepoGlob, globMatcher, validateItemRef, validateEdit, validateSessionBatch, MAX_SESSION_BATCH,
     MOMENTUM_DAYS, MOMENTUM_METRICS, dailyMomentum, momentumStart, validateMomentumInput, labelSummary } from "../model.mjs";
 import { createTrackingStore } from "../state.mjs";
@@ -99,15 +99,15 @@ test("parseItemUrl only accepts github.com issue and PR URLs", () => {
 test("normalizeTracking and validateItemRef validate input", () => {
     assert.deepEqual(normalizeTracking({ hidden: ["@BurkeHolland", "burkeholland", "Copilot"], repos: ["o/r", "O/R"] }), { hidden: ["burkeholland", AGENT], repos: ["o/r"] });
     assert.deepEqual(normalizeTracking({ repos: [] }), { hidden: [], repos: [] }, "hidden is optional");
-    assert.throws(() => normalizeTracking({ hidden: ["bad login!"], repos: [] }), TeamLoadError);
-    assert.throws(() => normalizeTracking({ repos: ["not-a-repo"] }), TeamLoadError);
-    assert.throws(() => normalizeTracking({ repos: ["o/r*"] }), TeamLoadError, "wildcards are expanded before they are stored");
-    assert.throws(() => normalizeTracking({ people: [], repos: [] }), TeamLoadError, "people are derived, not tracked");
-    assert.throws(() => normalizeTracking({ repos: Array.from({ length: 16 }, (_, i) => `o/r${i}`) }), TeamLoadError);
+    assert.throws(() => normalizeTracking({ hidden: ["bad login!"], repos: [] }), DispatchError);
+    assert.throws(() => normalizeTracking({ repos: ["not-a-repo"] }), DispatchError);
+    assert.throws(() => normalizeTracking({ repos: ["o/r*"] }), DispatchError, "wildcards are expanded before they are stored");
+    assert.throws(() => normalizeTracking({ people: [], repos: [] }), DispatchError, "people are derived, not tracked");
+    assert.throws(() => normalizeTracking({ repos: Array.from({ length: 16 }, (_, i) => `o/r${i}`) }), DispatchError);
     assert.deepEqual(validateItemRef({ repository: "o/r", number: 3, login: "@Copilot" }, { login: true }), { repository: "o/r", number: 3, login: AGENT });
-    assert.throws(() => validateItemRef({ repository: "o/r", number: 0 }), TeamLoadError);
-    assert.throws(() => validateItemRef({ repository: "o/r", number: 1, extra: true }), TeamLoadError);
-    assert.throws(() => validateItemRef({ repository: "o/r", number: 1, login: "a b" }, { login: true }), TeamLoadError);
+    assert.throws(() => validateItemRef({ repository: "o/r", number: 0 }), DispatchError);
+    assert.throws(() => validateItemRef({ repository: "o/r", number: 1, extra: true }), DispatchError);
+    assert.throws(() => validateItemRef({ repository: "o/r", number: 1, login: "a b" }, { login: true }), DispatchError);
 });
 
 test("set_tracking input takes repos and/or hidden, with owner/prefix* wildcards", () => {
@@ -255,7 +255,7 @@ test("profile requests are coalesced and cached; orgs are rejected", async () =>
     await assert.rejects(gh.profile("acme"), error => error.code === "not_found");
 });
 
-test("graphql errors surface as TeamLoadErrors", async () => {
+test("graphql errors surface as DispatchErrors", async () => {
     const { run } = fakeGh({ "nameWithOwner url": () => ({ errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] }) });
     await assert.rejects(createGitHub({ run }).repoInfo("o/missing"), error => error.code === "not_found");
 });
@@ -347,12 +347,12 @@ test("reassign never removes the source when adding the new owner fails or is ig
         const server = issueServer(["burkeholland"]);
         const run = async (args, options) => {
             if (args.includes("--add-assignee")) {
-                if (fail) throw new TeamLoadError("permission_denied", "Copilot is unavailable.");
+                if (fail) throw new DispatchError("permission_denied", "Copilot is unavailable.");
                 return "";
             }
             return server.run(args, options);
         };
-        await assert.rejects(createGitHub({ run }).reassign({ repository: "o/r", number: 5, from: "burkeholland", login: AGENT }), TeamLoadError);
+        await assert.rejects(createGitHub({ run }).reassign({ repository: "o/r", number: 5, from: "burkeholland", login: AGENT }), DispatchError);
         assert.ok(!server.calls.some(args => args.includes("--remove-assignee")));
         assert.deepEqual((await createGitHub({ run: server.run }).readIssue({ repository: "o/r", number: 5 })).assignees, ["burkeholland"]);
     }
@@ -361,7 +361,7 @@ test("reassign never removes the source when adding the new owner fails or is ig
 test("reassign reports partial writes explicitly when removing the source fails", async () => {
     const server = issueServer(["burkeholland"]);
     const run = async (args, options) => {
-        if (args.includes("--remove-assignee")) throw new TeamLoadError("permission_denied", "Removal denied.");
+        if (args.includes("--remove-assignee")) throw new DispatchError("permission_denied", "Removal denied.");
         return server.run(args, options);
     };
     const gh = createGitHub({ run });
@@ -484,29 +484,31 @@ test("detail normalizes issues and merged PRs", async () => {
 // ---------- tracking store ----------
 
 test("tracking store defaults, persists atomically, and remembers tracked repos", async () => {
-    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    const home = await mkdtemp(join(tmpdir(), "dispatch-"));
     try {
         const store = createTrackingStore(home);
-        assert.equal(store.path, join(home, "extensions", "team-load", "artifacts", "tracking.json"));
+        assert.equal(store.path, join(home, "extensions", "dispatch", "artifacts", "tracking.json"));
         assert.deepEqual(await store.read(), { repos: [], hidden: [], knownRepos: [], limit: 6, refreshSeconds: 300 });
         await Promise.all([
             store.write({ repos: ["o/r", "someone/else"], hidden: ["@Newperson"] }),
             store.write({ repos: ["o/r-mac"], hidden: [] }),
         ]);
         const saved = JSON.parse(await readFile(store.path, "utf8"));
-        assert.equal(saved.format, "team-load-tracking");
+        assert.equal(saved.format, "dispatch-tracking");
         assert.equal(saved.version, 1);
         assert.deepEqual(saved.repos, ["o/r-mac"]);
         assert.deepEqual(saved.hidden, []);
         assert.deepEqual(saved.knownRepos, ["o/r", "someone/else", "o/r-mac"]);
         assert.equal("people" in saved, false, "people come from the repositories, not the file");
+        await writeFile(store.path, JSON.stringify({ format: "team-load-tracking", version: 1, repos: ["o/legacy"], hidden: [] }));
+        assert.deepEqual((await store.read()).repos, ["o/legacy"], "tracking saved before the rename still loads");
         await writeFile(store.path, "{ broken");
         await assert.rejects(store.read(), error => error.code === "storage_error");
     } finally { await rm(home, { recursive: true, force: true }); }
 });
 
 test("tracking store keeps hand-edited settings and caps remembered repos", async () => {
-    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    const home = await mkdtemp(join(tmpdir(), "dispatch-"));
     try {
         const store = createTrackingStore(home);
         await store.write({ repos: ["o/r"] });
@@ -537,12 +539,12 @@ function hubFixture({ sendPrompt = async () => {}, issues = { "o/r": [issueNode(
     const historyCalls = [];
     const assignees = new Map();
     const github = {
-        fetchRepo: async name => { if (failing.includes(name)) throw new TeamLoadError("permission_denied", "no access"); return (issues[name] ?? []).map(node => normalizeIssue({ ...node, assignees: { nodes: (assignees.get(`${name}#${node.number}`) ?? []).map(login => ({ login })) } }, name)); },
+        fetchRepo: async name => { if (failing.includes(name)) throw new DispatchError("permission_denied", "no access"); return (issues[name] ?? []).map(node => normalizeIssue({ ...node, assignees: { nodes: (assignees.get(`${name}#${node.number}`) ?? []).map(login => ({ login })) } }, name)); },
         history: async (name, { days }) => { historyCalls.push([name, days]); return { events: events[name] ?? [], truncated: false }; },
-        repoInfo: async name => { if (name === "o/missing") throw new TeamLoadError("not_found", "nope"); return { nameWithOwner: name.replace(/^O\//, "o/"), url: `https://github.com/${name}`, open: 1, actors: name === "o/solo" ? [team[2]] : team }; },
+        repoInfo: async name => { if (name === "o/missing") throw new DispatchError("not_found", "nope"); return { nameWithOwner: name.replace(/^O\//, "o/"), url: `https://github.com/${name}`, open: 1, actors: name === "o/solo" ? [team[2]] : team }; },
         viewerRepos: async () => [{ nameWithOwner: "o/other", url: "https://github.com/o/other", open: 2 }],
-        ownerRepos: async owner => { if (owner === "ghost") throw new TeamLoadError("not_found", "no owner"); return ["o/web-app", "o/web-api", "o/webby", "o/other", "o/r"]; },
-        profile: async login => { if (login === "ghost404") throw new TeamLoadError("not_found", "no"); return { login, name: login.toUpperCase(), avatarUrl: null }; },
+        ownerRepos: async owner => { if (owner === "ghost") throw new DispatchError("not_found", "no owner"); return ["o/web-app", "o/web-api", "o/webby", "o/other", "o/r"]; },
+        profile: async login => { if (login === "ghost404") throw new DispatchError("not_found", "no"); return { login, name: login.toUpperCase(), avatarUrl: null }; },
         me: async () => "burkeholland",
         detail: async ref => ({ ...ref, title: "x" }),
         // Mirrors the real layer: without `additional` an owned issue is a conflict; with it, an existing assignee is a no-op.
@@ -550,7 +552,7 @@ function hubFixture({ sendPrompt = async () => {}, issues = { "o/r": [issueNode(
             const key = `${repository}#${number}`;
             const current = assignees.get(key) ?? [];
             if (additional && current.includes(login)) return { assignees: current, added: false };
-            if (!additional && current.length) throw new TeamLoadError("conflict", `${key} is already assigned.`);
+            if (!additional && current.length) throw new DispatchError("conflict", `${key} is already assigned.`);
             writes.push(["assign", repository, number, login, ...(additional ? ["additional"] : [])]);
             assignees.set(key, [...current, login]);
             return { assignees: [...current, login], added: true };
@@ -564,7 +566,7 @@ function hubFixture({ sendPrompt = async () => {}, issues = { "o/r": [issueNode(
         },
         reassign: async ({ repository, number, from, login }) => {
             const key = `${repository}#${number}`;
-            if (!(assignees.get(key) ?? []).includes(from)) throw new TeamLoadError("conflict", `${key} is no longer assigned to ${from}.`);
+            if (!(assignees.get(key) ?? []).includes(from)) throw new DispatchError("conflict", `${key} is no longer assigned to ${from}.`);
             const result = await github.assign({ repository, number, login, additional: true });
             const removed = await github.unassign({ repository, number, login: from });
             return { ...removed, added: result.added };
@@ -673,7 +675,7 @@ test("hub refreshes after a failed move so partial writes do not leave stale loa
     await hub.refresh(); await settle(hub);
     github.reassign = async () => {
         assignees.set("o/r#5", ["burkeholland", AGENT]);
-        throw new TeamLoadError("write_uncertain", "Removal failed.");
+        throw new DispatchError("write_uncertain", "Removal failed.");
     };
     await assert.rejects(hub.reassign({ repository: "o/r", number: 5, from: "burkeholland", login: AGENT }), error => error.code === "write_uncertain");
     assert.deepEqual(hub.state().items[0].assignees, ["burkeholland", AGENT]);
@@ -840,14 +842,14 @@ test("momentum shares one in-flight fetch per repository", async () => {
 test("momentum falls back to cached data when a refresh fails, and reports repositories it cannot read", async () => {
     const f = await momentumFixture();
     const first = await f.hub.momentum({ days: 7 });
-    f.github.history = async () => { throw new TeamLoadError("rate_limit", "slow down"); };
+    f.github.history = async () => { throw new DispatchError("rate_limit", "slow down"); };
     const stale = await f.hub.momentum({ days: 7, force: true });
     assert.deepEqual(stale.totals, first.totals, "cached data is still shown");
     assert.deepEqual(stale.errors.map(error => [error.repository, error.code, error.stale]), [["o/r", "rate_limit", true], ["o/other", "rate_limit", true]]);
 
     const partial = await momentumFixture();
     partial.github.history = async name => {
-        if (name === "o/other") throw new TeamLoadError("permission_denied", "no access");
+        if (name === "o/other") throw new DispatchError("permission_denied", "no access");
         return { events: momentumEvents[name], truncated: true };
     };
     const result = await partial.hub.momentum({ days: 7 });
@@ -884,8 +886,8 @@ test("perform validates action names and refresh input", async () => {
     await assert.rejects(perform({ hub }, "drop_tables", {}), error => error.code === "invalid_input");
     await assert.rejects(perform({ hub }, "refresh", { force: "yes" }), error => error.code === "invalid_input");
     await assert.rejects(perform({ hub }, "get_state", { extra: 1 }), error => error.code === "invalid_input");
-    assert.equal(statusFor(new TeamLoadError("conflict", "x")), 409);
-    assert.equal(statusFor(new TeamLoadError("rate_limit", "x")), 429);
+    assert.equal(statusFor(new DispatchError("conflict", "x")), 409);
+    assert.equal(statusFor(new DispatchError("rate_limit", "x")), 429);
     assert.equal(statusFor(new Error("boom")), 500);
 });
 
@@ -908,15 +910,15 @@ test("server enforces nonce, host, origin and CSP", async () => {
         assert.equal(page.headers.get("content-security-policy"), CSP);
         assert.doesNotMatch(CSP, /unsafe-inline|frame-ancestors \*/);
         const html = await page.text();
-        const nonce = html.match(/name="team-load-nonce" content="([^"]+)"/)[1];
+        const nonce = html.match(/name="dispatch-nonce" content="([^"]+)"/)[1];
         const call = (headers, body = { action: "get_state", input: {} }) => fetch(new URL("/api/action", server.url), { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
         assert.equal((await call({})).status, 403);
-        assert.equal((await call({ "x-team-load-nonce": "wrong" })).status, 403);
-        assert.equal((await call({ "x-team-load-nonce": nonce, origin: "https://evil.example" })).status, 403);
-        const ok = await call({ "x-team-load-nonce": nonce });
+        assert.equal((await call({ "x-dispatch-nonce": "wrong" })).status, 403);
+        assert.equal((await call({ "x-dispatch-nonce": nonce, origin: "https://evil.example" })).status, 403);
+        const ok = await call({ "x-dispatch-nonce": nonce });
         assert.equal(ok.status, 200);
         assert.ok(Array.isArray((await ok.json()).tracking.people));
-        assert.equal((await call({ "x-team-load-nonce": nonce }, { action: "assign", input: { repository: "o/r", number: 5, login: "stranger" } })).status, 400);
+        assert.equal((await call({ "x-dispatch-nonce": nonce }, { action: "assign", input: { repository: "o/r", number: 5, login: "stranger" } })).status, 400);
         for (const asset of ["/app.mjs", "/model.mjs", "/icons.mjs", "/markdown.mjs", "/momentum.mjs", "/styles.css"]) assert.equal((await fetch(new URL(asset, server.url))).status, 200, asset);
         assert.equal((await fetch(new URL("/config.json", server.url))).status, 404);
         assert.equal((await fetch(new URL("/../state.mjs", server.url))).status, 404);
@@ -1042,7 +1044,7 @@ test("a failed label page is not cached as a complete list", async () => {
     let fail = true;
     const { run, calls } = fakeGh({
         "labels(first": ({ vars }) => {
-            if (vars.after && fail) throw new TeamLoadError("permission_denied", "Labels unavailable");
+            if (vars.after && fail) throw new DispatchError("permission_denied", "Labels unavailable");
             return { data: { repository: { labels: vars.after ? page([{ name: "last", color: "7057ff" }]) : page([], "next") } } };
         },
     });
@@ -1170,7 +1172,7 @@ test("start_sessions is all or nothing when a claim fails, and rejects untracked
     const f = hubFixture({ sendPrompt: async prompt => prompts.push(prompt), issues: { "o/r": [issueNode(5), issueNode(6)] } });
     await f.hub.refresh(); await settle(f.hub);
     const assign = f.github.assign;
-    f.github.assign = async input => { if (input.number === 6) throw new TeamLoadError("conflict", "o/r#6 is closed."); return assign(input); };
+    f.github.assign = async input => { if (input.number === 6) throw new DispatchError("conflict", "o/r#6 is closed."); return assign(input); };
     await assert.rejects(f.hub.startSessions({ items: [{ repository: "o/r", number: 5 }, { repository: "o/r", number: 6 }] }), error => error.code === "conflict" && /o\/r#6.*no sessions were started/.test(error.message));
     assert.deepEqual(f.writes, [["assign", "o/r", 5, "burkeholland", "additional"], ["unassign", "o/r", 5, "burkeholland"]]);
     assert.equal(prompts.length, 0);
@@ -1234,8 +1236,8 @@ test("the action endpoint accepts long comments but caps bodies at 256 KiB", asy
     await f.hub.refresh(); await settle(f.hub);
     const server = await startServer(() => ({ hub: f.hub }));
     try {
-        const nonce = (await (await fetch(server.url)).text()).match(/name="team-load-nonce" content="([^"]+)"/)[1];
-        const call = body => fetch(new URL("/api/action", server.url), { method: "POST", headers: { "content-type": "application/json", "x-team-load-nonce": nonce }, body: JSON.stringify({ action: "comment", input: { repository: "o/r", number: 5, body } }) });
+        const nonce = (await (await fetch(server.url)).text()).match(/name="dispatch-nonce" content="([^"]+)"/)[1];
+        const call = body => fetch(new URL("/api/action", server.url), { method: "POST", headers: { "content-type": "application/json", "x-dispatch-nonce": nonce }, body: JSON.stringify({ action: "comment", input: { repository: "o/r", number: 5, body } }) });
         assert.equal((await call("x".repeat(60000))).status, 200);
         assert.notEqual((await call("x".repeat(300000))).status, 200);
     } finally { await server.close(); }
@@ -1438,7 +1440,7 @@ test("Project repos come from the kickoff selection and completed add_repository
     assert.deepEqual(selectedRepos("no selection here: o/a"), []);
     assert.equal(addedRepo({ clone_url: "https://github.com/o/c.git" }), "o/c");
     assert.equal(addedRepo({ path: "/tmp/x" }), null);
-    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    const home = await mkdtemp(join(tmpdir(), "dispatch-"));
     try {
         const start = (id, args) => ({ type: "tool.execution_start", data: { toolCallId: id, toolName: "add_repository", arguments: args } });
         const done = (id, success) => ({ type: "tool.execution_complete", data: { toolCallId: id, success } });
@@ -1464,14 +1466,14 @@ test("Project repos come from the kickoff selection and completed add_repository
 });
 
 test("a Project keeps its own tracking file, seeded from the global one", async () => {
-    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    const home = await mkdtemp(join(tmpdir(), "dispatch-"));
     try {
         const global = createTrackingStore(home);
         await global.write({ repos: ["o/global"], hidden: ["bot"] });
         const raw = JSON.parse(await readFile(global.path, "utf8"));
         await writeFile(global.path, JSON.stringify({ ...raw, limit: 3 }));
         const store = createTrackingStore(home, { project: "project-1" });
-        assert.equal(store.path, join(home, "extensions", "team-load", "artifacts", "projects", "project-1.json"));
+        assert.equal(store.path, join(home, "extensions", "dispatch", "artifacts", "projects", "project-1.json"));
         assert.deepEqual(await store.read(), { repos: [], hidden: ["bot"], knownRepos: ["o/global"], limit: 3, refreshSeconds: 300, projectRepos: [] });
         await store.write({ repos: ["o/a"], hidden: [], projectRepos: ["o/a", "o/b"] });
         const saved = JSON.parse(await readFile(store.path, "utf8"));
@@ -1483,7 +1485,7 @@ test("a Project keeps its own tracking file, seeded from the global one", async 
 });
 
 test("Project repos are tracked once, so removed ones stay removed, and the cap is respected", async () => {
-    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    const home = await mkdtemp(join(tmpdir(), "dispatch-"));
     try {
         const { github } = hubFixture();
         const hub = createHub({ store: createTrackingStore(home, { project: "project-1" }), github, project: true });

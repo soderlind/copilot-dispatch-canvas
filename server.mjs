@@ -2,12 +2,12 @@ import { createServer } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { TeamLoadError } from "./model.mjs";
+import { DispatchError } from "./model.mjs";
 import { extensionRoot } from "./state.mjs";
 import { renderHtml } from "./renderer.mjs";
 
 const empty = (input, name) => {
-    if (Object.keys(input).length) throw new TeamLoadError("invalid_input", `${name} takes no input.`);
+    if (Object.keys(input).length) throw new DispatchError("invalid_input", `${name} takes no input.`);
 };
 
 export async function perform(context, name, input = {}) {
@@ -16,7 +16,7 @@ export async function perform(context, name, input = {}) {
         case "get_state": empty(input, "get_state"); await hub.loadTracking(); return hub.state();
         case "refresh": {
             const extra = Object.keys(input).filter(key => key !== "force");
-            if (extra.length || (input.force !== undefined && typeof input.force !== "boolean")) throw new TeamLoadError("invalid_input", "refresh accepts only { force: boolean }.");
+            if (extra.length || (input.force !== undefined && typeof input.force !== "boolean")) throw new DispatchError("invalid_input", "refresh accepts only { force: boolean }.");
             return hub.refresh({ force: input.force ?? false });
         }
         case "set_tracking": return hub.setTracking(input);
@@ -34,7 +34,7 @@ export async function perform(context, name, input = {}) {
         case "set_item_state": return hub.setItemState(input);
         case "get_board": {
             if (Object.keys(input).some(key => key !== "force") || (input.force !== undefined && typeof input.force !== "boolean")) {
-                throw new TeamLoadError("invalid_input", "get_board accepts only { force: boolean }.");
+                throw new DispatchError("invalid_input", "get_board accepts only { force: boolean }.");
             }
             return hub.board.refresh(input);
         }
@@ -48,7 +48,7 @@ export async function perform(context, name, input = {}) {
         case "start_board_auth": empty(input, "start_board_auth"); return hub.scopeAuth.start();
         case "board_auth_status": empty(input, "board_auth_status"); return hub.scopeAuth.status();
         case "cancel_board_auth": empty(input, "cancel_board_auth"); return hub.scopeAuth.cancel();
-        default: throw new TeamLoadError("invalid_input", "Unknown Dispatch action.");
+        default: throw new DispatchError("invalid_input", "Unknown Dispatch action.");
     }
 }
 
@@ -70,7 +70,7 @@ export function statusFor(error) {
     if (error.code === "permission_denied") return 403;
     if (error.code === "not_found") return 404;
     if (error.code === "rate_limit") return 429;
-    return error instanceof TeamLoadError ? 400 : 500;
+    return error instanceof DispatchError ? 400 : 500;
 }
 
 export async function startServer(getContext, log = () => {}) {
@@ -99,7 +99,7 @@ export async function startServer(getContext, log = () => {}) {
                 send(200, await readFile(join(extensionRoot, ...relative.split("/")), "utf8"), type); return;
             }
             if (request.method === "POST" && url.pathname === "/api/action" && !url.search) {
-                const supplied = request.headers["x-team-load-nonce"];
+                const supplied = request.headers["x-dispatch-nonce"];
                 if (typeof supplied !== "string" || Buffer.byteLength(supplied) !== Buffer.byteLength(nonce)
                     || !timingSafeEqual(Buffer.from(supplied), Buffer.from(nonce))) {
                     send(403, { code: "forbidden", error: "Invalid request nonce. Reopen the canvas." }); return;
@@ -110,23 +110,23 @@ export async function startServer(getContext, log = () => {}) {
                 for await (const chunk of request) {
                     size += chunk.length;
                     // Room for a maximum-length comment in any script.
-                    if (size > 262144) throw new TeamLoadError("invalid_input", "The request body exceeds 256 KiB.");
+                    if (size > 262144) throw new DispatchError("invalid_input", "The request body exceeds 256 KiB.");
                     chunks.push(chunk);
                 }
                 let body;
                 try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
-                catch { throw new TeamLoadError("invalid_input", "The request body is not valid JSON."); }
+                catch { throw new DispatchError("invalid_input", "The request body is not valid JSON."); }
                 if (!body || typeof body !== "object" || Array.isArray(body)
                     || Object.keys(body).some(key => !["action", "input"].includes(key))
                     || typeof body.action !== "string" || !body.input || typeof body.input !== "object" || Array.isArray(body.input)) {
-                    throw new TeamLoadError("invalid_input", "Provide an action name and an input object.");
+                    throw new DispatchError("invalid_input", "Provide an action name and an input object.");
                 }
                 send(200, await perform(getContext(), body.action, body.input)); return;
             }
             send(404, { code: "not_found", error: "Not found." });
         } catch (error) {
             log(error.message);
-            send(statusFor(error), { code: error.code ?? "internal_error", error: error instanceof TeamLoadError ? error.message : "Dispatch hit an unexpected error. Check extension diagnostics.", retryAt: error.retryAt ?? null });
+            send(statusFor(error), { code: error.code ?? "internal_error", error: error instanceof DispatchError ? error.message : "Dispatch hit an unexpected error. Check extension diagnostics.", retryAt: error.retryAt ?? null });
         }
     });
     await new Promise((resolve, reject) => {
