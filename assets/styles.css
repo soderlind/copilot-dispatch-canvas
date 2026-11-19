@@ -126,6 +126,10 @@ h1 { font-size: 20px; line-height: 28px; font-weight: 600; margin: 0; }
 }
 .board-form { display: grid; justify-items: start; gap: 10px; max-width: 540px; padding: 12px; }
 .board-form p { margin: 0; }
+.board-auth { display: grid; justify-items: start; gap: 8px; max-width: 540px; padding: 12px; margin: 0 0 16px; }
+.board-auth h2 { margin: 0; font-size: 16px; }
+.board-auth p { margin: 0; }
+.board-auth-code code { font-size: 22px; letter-spacing: 2px; padding: 4px 10px; }
 .board-form input[type="number"] { width: 7em; }
 .board-settings { margin-top: 12px; }
 .board-settings > summary { cursor: pointer; }

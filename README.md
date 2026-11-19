@@ -1,4 +1,4 @@
-# Team load canvas
+# Dispatch canvas
 
 A Copilot app canvas (`team-load`) that shows what each teammate and the Copilot coding agent is working on, so you can hand out new work to whoever has room. It is a user-scope extension in `~/.copilot/extensions/team-load/`, based on [tinyclips-team-load](https://github.com/jamesmontemagno/tiny-clips/tree/main/.github/extensions/tinyclips-team-load). There is no `config.json`: you choose repos in the canvas, and the people come from those repos.
 
@@ -49,13 +49,9 @@ Moving also verifies that the source still owns the issue. If the target cannot 
 
 ## Board setup
 
-The Board needs the `gh` token's **write `project` scope** in addition to repository access:
+The Board uses your **stored `gh` login**, ignoring `GH_TOKEN` and `GITHUB_TOKEN` (the Copilot app injects a `GH_TOKEN` that cannot gain new scopes). Workload keeps using the environment token. The stored login needs the **write `project` scope** in addition to repository access.
 
-```bash
-gh auth refresh -h github.com -s project
-```
-
-If `GH_TOKEN` or `GITHUB_TOKEN` overrides your CLI login, replace it with a token with the required access or unset it. For organization Projects, check SSO authorization and Project write access as well.
+When the scope is missing, the Board shows **Grant Project access**. It runs `gh auth refresh -h github.com -s project` in the background, shows the one-time code (also copied to your clipboard) with a link to `github.com/login/device`, and reloads the Board once you approve. Your existing scopes are kept. You can also run the command yourself in a terminal. If `gh` has no stored login, run `gh auth login` first. For organization Projects, check SSO authorization and Project write access as well.
 
 Open **Board** and link an editable GitHub Project with a single-select `Status` field. The canvas checks the tracked repo owners and the signed-in user's Projects. Reuse an existing Project if it fits your repos. If none of the listed Projects fit, choose to create one under the common repo owner, or choose an owner when repos have different owners. Creation requires explicit confirmation. Each global or Copilot Project tracking scope stores its own link and Board settings.
 

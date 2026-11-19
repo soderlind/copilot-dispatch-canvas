@@ -19,7 +19,7 @@ const timeline = `timelineItems(${events}){
     }}`;
 const historyQuery = `query($id:ID!,$before:String){node(id:$id){... on Issue{${timeline}} ... on PullRequest{${timeline}}}}`;
 
-const authHelp = "Board requires the GitHub CLI token's write `project` scope. Run `gh auth refresh -h github.com -s project`, then retry. If GH_TOKEN or GITHUB_TOKEN overrides gh login, replace or unset it. For organization Projects, check SSO and Project write access.";
+const authHelp = "Board uses your stored GitHub CLI login (not GH_TOKEN or GITHUB_TOKEN) and needs its write `project` scope. Use Grant Project access below, or run `gh auth refresh -h github.com -s project`, then retry. For organization Projects, check SSO and Project write access.";
 const missingScope = () => new TeamLoadError("permission_denied", authHelp);
 export const suitableProject = project => !!(project && !project.closed && !project.template && project.viewerCanUpdate && project.status?.options?.length);
 

@@ -5,9 +5,15 @@ import { extensionRoot } from "./state.mjs";
 
 const exec = promisify(execFile);
 const redact = text => String(text).replace(/\b(?:gh[pousr]_[\w]+|github_pat_[\w]+)\b/g, "[redacted]").slice(0, 1200);
-const env = () => ({ ...process.env, GH_PROMPT_DISABLED: "1", GH_PAGER: "", GH_HOST: "github.com", NO_COLOR: "1" });
+// `storedLogin` drops token overrides (e.g. the GH_TOKEN the Copilot app injects) so gh uses its own refreshable login.
+export function ghEnv({ storedLogin = false } = {}) {
+    const value = { ...process.env, GH_PROMPT_DISABLED: "1", GH_PAGER: "", GH_HOST: "github.com", NO_COLOR: "1" };
+    if (storedLogin) for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) delete value[name];
+    return value;
+}
 
-export async function runGh(args, { json = true, input = null } = {}) {
+export async function runGh(args, { json = true, input = null, storedLogin = false } = {}) {
+    const env = () => ghEnv({ storedLogin });
     try {
         const pending = exec("gh", args, {
             cwd: extensionRoot, windowsHide: true, encoding: "utf8", timeout: 45_000, maxBuffer: 16 * 1024 * 1024, env: env(),
@@ -126,7 +132,7 @@ export function issueEvents(node, repository) {
     ];
 }
 
-export function createGitHub({ run = runGh, now = () => Date.now(), log = () => {} } = {}) {
+export function createGitHub({ run = runGh, now = () => Date.now(), log = () => {}, storedLogin = false } = {}) {
     let active = 0;
     const waiting = [];
     const profiles = new Map();
@@ -138,6 +144,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
         if (active >= 3) await new Promise(resolve => waiting.push(resolve));
         else active++;
         try {
+            if (storedLogin) options = { ...options, storedLogin: true };
             try { return await run(args, options); }
             catch (error) {
                 const write = args.includes("--method") || args[0] === "issue" || args[0] === "pr"
@@ -359,7 +366,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
     async function assign({ repository, number, login, additional = false, issuesOnly = false, rollbackOnFailure = false }) {
         const before = await readIssue({ repository, number });
         if (before.isPr && issuesOnly) throw new TeamLoadError("invalid_input", `${repository}#${number} is a pull request. Sessions can only be started for issues.`);
-        if (before.isPr && (login === AGENT || !additional)) throw new TeamLoadError("invalid_input", login === AGENT ? "Copilot can only be assigned to issues." : "Only issues can be triaged from Team Load.");
+        if (before.isPr && (login === AGENT || !additional)) throw new TeamLoadError("invalid_input", login === AGENT ? "Copilot can only be assigned to issues." : "Only issues can be triaged from Dispatch.");
         if (before.state !== "open") throw new TeamLoadError("conflict", `${repository}#${number} is closed.`);
         if (additional && before.assignees.includes(login)) return { assignees: before.assignees, added: false };
         if (!additional && before.assignees.length) throw new TeamLoadError("conflict", `${repository}#${number} is already assigned to ${before.assignees.map(l => l === AGENT ? "Copilot" : `@${l}`).join(", ")}.`);
@@ -394,7 +401,7 @@ export function createGitHub({ run = runGh, now = () => Date.now(), log = () => 
     async function reassign({ repository, number, from, login }) {
         if (from === login) throw new TeamLoadError("invalid_input", "Choose a different assignee to move the issue to.");
         const before = await readIssue({ repository, number });
-        if (before.isPr) throw new TeamLoadError("invalid_input", "Only issues can be moved from Team Load.");
+        if (before.isPr) throw new TeamLoadError("invalid_input", "Only issues can be moved from Dispatch.");
         if (before.state !== "open") throw new TeamLoadError("conflict", `${repository}#${number} is closed.`);
         if (!before.assignees.includes(from)) throw new TeamLoadError("conflict", `${repository}#${number} is no longer assigned to ${from}. Refresh before moving it.`);
         // Verify the new owner before removing the old one, so a rejected assignment never leaves the issue unowned.

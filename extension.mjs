@@ -29,7 +29,7 @@ async function createContext() {
     try {
         projectRepos = await detectProjectRepos({ sessionId: current.sessionId, getEvents: () => current.getEvents() });
     } catch (error) {
-        log(`Team Load: could not read this session's Project repositories (${error.message}); using global tracking.`);
+        log(`Dispatch: could not read this session's Project repositories (${error.message}); using global tracking.`);
     }
     const project = projectRepos !== null;
     const sendPrompt = async prompt => {
@@ -37,14 +37,15 @@ async function createContext() {
         return session.send({ prompt });
     };
     const store = createTrackingStore(undefined, project ? { project: current.sessionId } : {});
-    const hub = createHub({ store, github: createGitHub({ log }), sendPrompt, log, project });
+    // The Board needs the `project` scope, which the app-injected GH_TOKEN can never gain, so it uses gh's stored login.
+    const hub = createHub({ store, github: createGitHub({ log }), boardGithub: createGitHub({ log, storedLogin: true }), sendPrompt, log, project });
     if (project) await syncProjectRepos(hub, [...projectRepos, ...liveProjectRepos.splice(0)]);
     return { hub, project };
 }
 
 async function syncProjectRepos(hub, names) {
     const { skipped } = await hub.addProjectRepos(names);
-    if (skipped.length) log(`Team Load: this Project has more repositories than can be tracked at once; not tracking ${skipped.join(", ")}. Choose them in the Tracking panel.`);
+    if (skipped.length) log(`Dispatch: this Project has more repositories than can be tracked at once; not tracking ${skipped.join(", ")}. Choose them in the Tracking panel.`);
 }
 
 async function configure() {
@@ -73,7 +74,7 @@ const action = (name, description, inputSchema) => ({
 session = await joinSession({
     canvases: [createCanvas({
         id: "team-load",
-        displayName: "Team load",
+        displayName: "Dispatch",
         description: "See what everyone in your tracked GitHub repos (and Copilot) is working on, how active the team has been, and assign or reassign issues to whoever has capacity.",
         actions: [
             action("get_state", "Read the tracked repos, the team derived from them (assignable users and assignees, minus hidden people), and the open issues and PRs that make up each person's current load."),
@@ -109,7 +110,7 @@ session = await joinSession({
                 instances.set(ctx.instanceId, entry);
             }
             try {
-                return { title: "Team load", status: "Who's on what, and who has room", url: (await entry).url };
+                return { title: "Dispatch", status: "Who's on what, and who has room", url: (await entry).url };
             } catch (error) {
                 if (instances.get(ctx.instanceId) === entry) instances.delete(ctx.instanceId);
                 throw error;

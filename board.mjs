@@ -74,7 +74,7 @@ export function createBoard({ github, tracking, save, openWork, now = Date.now, 
                         since = await github.statusSince(item, statusName);
                         ages.set(item.id, { key: ageKey, at: now(), since });
                     } catch (error) {
-                        log(`Team Load Board history: ${error.message}`);
+                        log(`Dispatch Board history: ${error.message}`);
                         const warning = `Some status history could not be read: ${error.message}`;
                         if (!warnings.includes(warning)) warnings.push(warning);
                     }

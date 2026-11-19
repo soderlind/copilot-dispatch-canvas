@@ -45,7 +45,10 @@ export async function perform(context, name, input = {}) {
         case "configure_board": await hub.board.configure(input); return hub.state();
         case "move_board_card": await hub.board.move(input); return hub.state();
         case "disconnect_board": await hub.board.disconnect(input); return hub.state();
-        default: throw new TeamLoadError("invalid_input", "Unknown Team Load action.");
+        case "start_board_auth": empty(input, "start_board_auth"); return hub.scopeAuth.start();
+        case "board_auth_status": empty(input, "board_auth_status"); return hub.scopeAuth.status();
+        case "cancel_board_auth": empty(input, "cancel_board_auth"); return hub.scopeAuth.cancel();
+        default: throw new TeamLoadError("invalid_input", "Unknown Dispatch action.");
     }
 }
 
@@ -123,7 +126,7 @@ export async function startServer(getContext, log = () => {}) {
             send(404, { code: "not_found", error: "Not found." });
         } catch (error) {
             log(error.message);
-            send(statusFor(error), { code: error.code ?? "internal_error", error: error instanceof TeamLoadError ? error.message : "Team Load hit an unexpected error. Check extension diagnostics.", retryAt: error.retryAt ?? null });
+            send(statusFor(error), { code: error.code ?? "internal_error", error: error instanceof TeamLoadError ? error.message : "Dispatch hit an unexpected error. Check extension diagnostics.", retryAt: error.retryAt ?? null });
         }
     });
     await new Promise((resolve, reject) => {

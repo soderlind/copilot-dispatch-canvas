@@ -244,3 +244,55 @@ test("linked Board adds newly fetched open work when the hub refreshes, even on 
         assert.deepEqual(added, ["first", "second"]);
     } finally { await server.close(); }
 });
+
+test("Board scope auth surfaces the device code and reports completion", async () => {
+    const { PassThrough } = await import("node:stream");
+    const { EventEmitter } = await import("node:events");
+    const { createScopeAuth } = await import("../gh-auth.mjs");
+    const spawned = [];
+    let done = 0;
+    const spawn = (command, args, options) => {
+        const child = new EventEmitter();
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.kill = () => child.emit("close", null, "SIGTERM");
+        spawned.push({ command, args, env: options.env, child });
+        return child;
+    };
+    const auth = createScopeAuth({ spawn, onDone: () => { done++; } });
+    const started = auth.start();
+    const { child, args, env } = spawned[0];
+    assert.deepEqual(args, ["auth", "refresh", "--hostname", "github.com", "--scopes", "project"]);
+    assert.equal(env.GH_TOKEN, undefined);
+    assert.equal(env.GITHUB_TOKEN, undefined);
+    child.stderr.write("! One-time code (ABCD-1234) copied to clipboard\n");
+    child.stderr.write("Open this URL to continue in your web browser: https://github.com/login/device\n");
+    assert.deepEqual(await started, { status: "waiting", code: "ABCD-1234", url: "https://github.com/login/device" });
+    assert.deepEqual(await auth.start(), auth.status(), "a second start reuses the running flow");
+    assert.equal(spawned.length, 1);
+    child.emit("close", 0, null);
+    assert.deepEqual(auth.status(), { status: "done" });
+    assert.equal(done, 1);
+
+    const failing = createScopeAuth({ spawn });
+    const result = failing.start();
+    spawned[1].child.stderr.write("You are not logged into any GitHub hosts. To log in, run: gh auth login\n");
+    spawned[1].child.emit("close", 1, null);
+    const failed = await result;
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error, /gh auth login/);
+});
+
+test("stored-login gh env drops token overrides", async () => {
+    const { ghEnv } = await import("../github.mjs");
+    const saved = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN };
+    process.env.GH_TOKEN = "x"; process.env.GITHUB_TOKEN = "y";
+    try {
+        assert.equal(ghEnv().GH_TOKEN, "x");
+        const stored = ghEnv({ storedLogin: true });
+        assert.equal(stored.GH_TOKEN, undefined);
+        assert.equal(stored.GITHUB_TOKEN, undefined);
+    } finally {
+        for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : process.env[key] = value;
+    }
+});

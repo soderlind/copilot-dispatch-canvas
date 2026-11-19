@@ -2,6 +2,7 @@ import { AGENT, DEFAULT_LIMIT, DEFAULT_REFRESH_SECONDS, MAX_REPOS, TeamLoadError
 import { createGitHub } from "./github.mjs";
 import { createBoardGitHub } from "./board-github.mjs";
 import { createBoard } from "./board.mjs";
+import { createScopeAuth } from "./gh-auth.mjs";
 
 const STALE_MS = 30_000;
 const RECENT_TTL_MS = 10 * 60_000;
@@ -11,7 +12,7 @@ const EMPTY = { repos: [], hidden: [], knownRepos: [], limit: DEFAULT_LIMIT, ref
 
 // The team is derived from the tracked repositories: everyone who can be assigned there (plus Copilot when enabled),
 // and anyone already assigned to open work. Tracking only stores the repositories and the people to hide.
-export function createHub({ store, github = createGitHub(), sendPrompt = null, now = () => Date.now(), log = () => {}, project = false }) {
+export function createHub({ store, github = createGitHub(), boardGithub = github, scopeAuth = createScopeAuth(), sendPrompt = null, now = () => Date.now(), log = () => {}, project = false }) {
     const repos = new Map();          // lower(nwo) -> { name, status, items, error, fetchedAt, pending }
     const infos = new Map();          // lower(nwo) -> { nameWithOwner, url, open }
     const histories = new Map();      // lower(nwo) -> { ready: { days, fetchedAt, events, truncated } | null, pending: { days, promise } | null }
@@ -39,7 +40,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
     }
 
     const board = createBoard({
-        github: createBoardGitHub(github, now), tracking: loadTracking, now, log: diagnose,
+        github: createBoardGitHub(boardGithub, now), tracking: loadTracking, now, log: diagnose,
         save: serial(async board => {
             tracking = await store.write({ ...await loadTracking(), board });
             bump();
@@ -82,7 +83,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
             })
             .catch(error => {
                 if (generation !== entry.generation) return;
-                diagnose(`Team Load: ${name}: ${error.message}`);
+                diagnose(`Dispatch: ${name}: ${error.message}`);
                 Object.assign(entry, { status: entry.fetchedAt ? "stale" : "error", error: { code: error.code ?? "github_error", message: error.message, retryAt: error.retryAt ?? null } });
             })
             .finally(() => { if (entry.pending === pending) entry.pending = null; bump(); }));
@@ -102,7 +103,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
         track(github.repoInfo(name, { force })
             .then(rememberInfo)
             .catch(error => {
-                diagnose(`Team Load: ${name} info: ${error.message}`);
+                diagnose(`Dispatch: ${name} info: ${error.message}`);
                 if (!infos.has(name.toLowerCase())) infos.set(name.toLowerCase(), { nameWithOwner: name, url: `https://github.com/${name}`, open: null });
             })
             .finally(bump));
@@ -115,7 +116,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
                 recent = { at: now(), names: list.map(info => info.nameWithOwner) };
             })
             .catch(error => {
-                diagnose(`Team Load: your repositories: ${error.message}`);
+                diagnose(`Dispatch: your repositories: ${error.message}`);
                 recent = { at: now(), names: recent?.names ?? [] };
             })
             .finally(bump));
@@ -123,7 +124,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
 
     async function refresh({ force = false } = {}) {
         const current = await loadTracking();
-        if (!me) track(github.me().then(login => { me = canonLogin(login); }).catch(error => diagnose(`Team Load: viewer: ${error.message}`)).finally(bump));
+        if (!me) track(github.me().then(login => { me = canonLogin(login); }).catch(error => diagnose(`Dispatch: viewer: ${error.message}`)).finally(bump));
         if (force || !recent || now() - recent.at > RECENT_TTL_MS) refreshRecent(force);
         for (const name of current.repos) {
             const entry = repos.get(name.toLowerCase());
@@ -132,7 +133,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
             refreshInfo(name, force);
         }
         for (const name of current.knownRepos) if (!infos.has(name.toLowerCase())) refreshInfo(name, false);
-        if (current.board) board.refresh({ force }).catch(error => diagnose(`Team Load Board: ${error.message}`));
+        if (current.board) board.refresh({ force }).catch(error => diagnose(`Dispatch Board: ${error.message}`));
         return state();
     }
 
@@ -310,7 +311,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
             if (added) {
                 await github.unassign({ repository, number: ref.number, login }).catch(cleanup => {
                     rolledBack = false;
-                    diagnose(`Team Load: rollback failed: ${cleanup.message}`);
+                    diagnose(`Dispatch: rollback failed: ${cleanup.message}`);
                 });
             }
             await refreshRepo(repository, { wait: true, fresh: true });
@@ -339,7 +340,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
             for (const item of claimed.filter(entry => entry.added)) {
                 await github.unassign({ repository: item.repository, number: item.number, login }).catch(cleanup => {
                     stuck.push(`#${item.number}`);
-                    diagnose(`Team Load: rollback failed: ${cleanup.message}`);
+                    diagnose(`Dispatch: rollback failed: ${cleanup.message}`);
                 });
             }
             await refreshAll();
@@ -388,7 +389,7 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
                 if (replace) entry.ready = result;
                 return { ...result, stale: false };
             } catch (error) {
-                diagnose(`Team Load: ${name} history: ${error.message}`);
+                diagnose(`Dispatch: ${name} history: ${error.message}`);
                 if (usable) return { ...cached, stale: true, error };
                 throw error;
             } finally {
@@ -481,5 +482,5 @@ export function createHub({ store, github = createGitHub(), sendPrompt = null, n
         return { ...result, state: state() };
     }
 
-    return { refresh, state, board, setTracking: serial(setTracking), addProjectRepos: serial(addProjectRepos), assign, unassign, reassign, startSession, startSessions, detail, momentum, loadTracking, comment, deleteComment, repoLabels, editLabel, setItemState };
+    return { refresh, state, board, scopeAuth, setTracking: serial(setTracking), addProjectRepos: serial(addProjectRepos), assign, unassign, reassign, startSession, startSessions, detail, momentum, loadTracking, comment, deleteComment, repoLabels, editLabel, setItemState };
 }

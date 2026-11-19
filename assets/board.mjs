@@ -11,6 +11,9 @@ export function statusAge(since, threshold, now = Date.now()) {
 export function createBoardPanel({ host, content, errorElement, announcement, post, context, onChange, esc, hashFor }) {
     let data, key, pending, dragged;
     let version = 0;
+    let authNeeded = false;
+    let auth = null;          // { status: "starting"|"waiting"|"done"|"failed", code?, url?, error? }
+    let authTimer = null;
     let writing = false;
     const currentKey = () => {
         const state = context();
@@ -41,7 +44,7 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
           ${owners.length === 1 ? `<p>Owner: <strong>${esc(writable[0].login)}</strong></p><input type="hidden" name="ownerId" value="${esc(writable[0].id)}">`
             : `<label>Owner <select name="ownerId" aria-label="Owner" required><option value="">Choose a tracked repo owner</option>${opts(writable.map(o => [o.id, o.login]))}</select></label>`}
           ${writable.some(owner => owner.canCreate === null) ? `<p class="dim">GitHub checks organization creation permissions when you submit.</p>` : ""}
-          <label>Title <input name="title" value="Team load" maxlength="100" required></label>
+          <label>Title <input name="title" value="Dispatch" maxlength="100" required></label>
           <label><input name="confirmed" type="checkbox" required> I confirm creating and populating this Project on GitHub.</label>
           <button type="submit" class="btn">Create Project</button>
         </form>`;
@@ -96,10 +99,63 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
     }
     const disconnectHTML = () => `<button type="button" class="btn" data-disconnect>Unlink Project</button><p class="dim">Unlinking does not remove any items or change the Project on GitHub.</p>`;
 
+    function authHTML() {
+        if (!authNeeded) return "";
+        if (auth?.status === "starting") return `<div class="board-auth box" aria-busy="true"><p>Starting GitHub authorization…</p></div>`;
+        if (auth?.status === "waiting") {
+            const url = /^https:\/\/github\.com\/login\/device\b/.test(auth.url) ? auth.url : "https://github.com/login/device";
+            return `<div class="board-auth box" role="status">
+              <h2>Approve Project access on GitHub</h2>
+              <p>Enter this one-time code (it is also on your clipboard):</p>
+              <p class="board-auth-code"><code>${esc(auth.code)}</code></p>
+              <p><a class="btn" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open ${esc(url.replace(/^https:\/\//, ""))}</a>
+                <button type="button" class="btn" data-auth-cancel>Cancel</button></p>
+              <p class="dim">Waiting for approval… The Board reloads when GitHub confirms.</p>
+            </div>`;
+        }
+        return `<div class="board-auth box">
+          <h2>Grant Project access</h2>
+          <p>Dispatch will run <code>gh auth refresh -s project</code> for your stored GitHub CLI login and show a one-time code to approve in your browser. Your other scopes are kept.</p>
+          ${auth?.status === "failed" ? `<p class="board-warning">${esc(auth.error ?? "Authorization failed.")}</p>` : ""}
+          <button type="button" class="btn" data-auth-start>${auth?.status === "failed" ? "Try again" : "Grant Project access"}</button>
+        </div>`;
+    }
+
+    function stopPolling() {
+        clearTimeout(authTimer);
+        authTimer = null;
+    }
+
+    function adopt(next) {
+        auth = next?.status === "idle" ? null : next;
+        stopPolling();
+        if (auth?.status === "done") {
+            auth = null;
+            authNeeded = false;
+            announce("GitHub Project access granted.");
+            sync({ force: true });
+            return;
+        }
+        if (!data) render();
+        if (auth?.status === "starting" || auth?.status === "waiting") authTimer = setTimeout(poll, 2000);
+    }
+
+    async function poll() {
+        try { adopt(await post("board_auth_status", {})); }
+        catch (failure) { adopt({ status: "failed", error: failure.message }); }
+    }
+
+    async function startAuth() {
+        adopt({ status: "starting" });
+        stopPolling();
+        try { adopt(await post("start_board_auth", {})); }
+        catch (failure) { adopt({ status: "failed", error: failure.message }); }
+    }
+
     function render() {
         const settingsOpen = content.querySelector(".board-settings")?.open;
         content.innerHTML = data?.setup ? setup(data) : data ? boardHTML()
-            : `<p class="empty-note">Board data is unavailable.</p>${context()?.boardProjectId ? disconnectHTML() : ""}`;
+            : `${authHTML()}<p class="empty-note">Board data is unavailable.</p>${context()?.boardProjectId ? disconnectHTML() : ""}`;
         if (settingsOpen && content.querySelector(".board-settings")) content.querySelector(".board-settings").open = true;
     }
 
@@ -121,13 +177,17 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
                 if (token !== version || nextKey !== currentKey()) return;
                 const changed = !data || JSON.stringify(data) !== JSON.stringify(next);
                 data = next;
+                authNeeded = false;
                 error(null);
                 if (changed || !content.querySelector("form input:focus, form select:focus, .board-card :focus")) render();
             } catch (failure) {
                 if (token !== version || nextKey !== currentKey()) return;
                 data = null;
+                authNeeded = failure.code === "permission_denied";
                 error(failure.message);
                 render();
+                // Pick up an authorization already running (e.g. after the canvas was reopened).
+                if (authNeeded && !auth) poll();
             } finally {
                 if (token === version) {
                     pending = null;
@@ -187,6 +247,11 @@ export function createBoardPanel({ host, content, errorElement, announcement, po
         }
     });
     host.addEventListener("click", event => {
+        if (event.target.closest("[data-auth-start]")) { startAuth(); return; }
+        if (event.target.closest("[data-auth-cancel]")) {
+            post("cancel_board_auth", {}).then(() => poll(), failure => adopt({ status: "failed", error: failure.message }));
+            return;
+        }
         if (event.target.closest("[data-disconnect]")) {
             const projectId = context()?.boardProjectId;
             if (projectId) write("disconnect_board", { projectId }, "GitHub Project unlinked.");

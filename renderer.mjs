@@ -7,7 +7,7 @@ export function renderHtml(nonce, theme = null) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="team-load-nonce" content="${nonce}">
 <meta name="referrer" content="no-referrer">
-<title>Team load</title>
+<title>Dispatch</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/styles.css">
 <script type="module" src="/app.mjs"></script>
@@ -16,7 +16,7 @@ export function renderHtml(nonce, theme = null) {
 <div class="app" id="home">
   <header class="topbar">
     <div class="title">
-      <h1>Team load</h1>
+      <h1>Dispatch</h1>
       <p class="meta"><button class="scope-btn" type="button" id="scope-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="scope">Tracking…</button><span class="dim" id="updated"></span></p>
     </div>
     <div class="toolbar">
@@ -37,7 +37,7 @@ export function renderHtml(nonce, theme = null) {
     </div>
   </header>
   <div class="notice" id="notice" role="alert" hidden></div>
-  <div class="seg home-tabs" role="tablist" aria-label="Team load view">
+  <div class="seg home-tabs" role="tablist" aria-label="Dispatch view">
     <button type="button" role="tab" id="workload-tab" aria-controls="workload" aria-selected="true">Workload</button>
     <button type="button" role="tab" id="board-tab" aria-controls="board" aria-selected="false" tabindex="-1">Board</button>
   </div>

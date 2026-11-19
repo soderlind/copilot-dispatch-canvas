@@ -9,7 +9,7 @@ const repo = "octo/demo";
 const title = "Fix the Board layout";
 const date = "2026-01-02T10:00:00Z";
 const project = {
-    id: "p-team", number: 2, title: "Team load", viewerCanUpdate: true,
+    id: "p-team", number: 2, title: "Dispatch", viewerCanUpdate: true,
     status: { id: "field", options: [{ id: "todo", name: "Todo" }, { id: "done", name: "Done" }] },
 };
 const unrelated = { ...project, id: "p-personal", number: 1, title: "Personal errands" };
@@ -117,7 +117,7 @@ test("Board browser: tabs, confirmed creation, populated columns, status move an
             await expectVisible(cardIn(done));
             assert.equal(await tab("Board").getAttribute("aria-selected"), "true");
             assert.deepEqual(mutations, [
-                ["create", { owner: "owner", title: "Team load" }],
+                ["create", { owner: "owner", title: "Dispatch" }],
                 ["add", { project: "p-team", content: "issue" }],
                 ["move", { project: "p-team", item: "card", field: "field", option: "done" }],
             ]);
