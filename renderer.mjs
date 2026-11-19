@@ -37,7 +37,11 @@ export function renderHtml(nonce, theme = null) {
     </div>
   </header>
   <div class="notice" id="notice" role="alert" hidden></div>
-  <div class="grid">
+  <div class="seg home-tabs" role="tablist" aria-label="Team load view">
+    <button type="button" role="tab" id="workload-tab" aria-controls="workload" aria-selected="true">Workload</button>
+    <button type="button" role="tab" id="board-tab" aria-controls="board" aria-selected="false" tabindex="-1">Board</button>
+  </div>
+  <div id="workload" class="grid" role="tabpanel" aria-labelledby="workload-tab">
     <section class="box roster-box" aria-labelledby="roster-h">
       <div class="box-head">
         <h2 id="roster-h">Who’s on what</h2>
@@ -58,6 +62,11 @@ export function renderHtml(nonce, theme = null) {
       <section class="box momentum-box" id="momentum"></section>
     </div>
   </div>
+  <section id="board" role="tabpanel" aria-labelledby="board-tab" hidden>
+    <p class="notice" id="board-error" role="alert" hidden></p>
+    <p class="sr-only" id="board-announcement" role="status"></p>
+    <div id="board-content"></div>
+  </section>
 </div>
 <div class="app detail-view" id="detail" hidden></div>
 <div class="app detail-view person-view" id="person" hidden></div>

@@ -4,16 +4,16 @@
 
 ### GitHub Projects board
 
-- [ ] Add a scrum / kanban board tab for tracked issues and pull requests.
-- [ ] Use GitHub Projects v2 as the backend; map columns to the Project's single-select `Status` field and persist card moves there.
-- [ ] When no suitable Project exists, offer to create one and add open issues and pull requests from tracked repositories.
-- [ ] Decide whether to use one Project for all tracked repos or one per repo.
-- [ ] Decide whether the Project is user-owned or org-owned.
-- [ ] Define how the Project is linked to tracked repos and how repo changes are synchronized.
-- [ ] Decide whether to support a sprint / iteration field or start with kanban only.
-- [ ] Document and validate the required `project` token scope (`gh auth refresh -s project`).
-- [ ] Add configurable WIP limits per board column.
-- [ ] Show time in status so the team can spot bottlenecks.
+- [x] Add a kanban Board tab for tracked issues and pull requests.
+- [x] Map columns to the GitHub Project v2 single-select `Status` field and persist card moves there.
+- [x] Prefer an existing editable Project; if no candidate fits, offer creation only with explicit confirmation.
+- [x] Share one GitHub Project across tracked repos in each tracking scope.
+- [x] Infer the Project creation owner from tracked repos or ask when owners differ.
+- [x] Add open work at setup and on refresh; hide untracked work without removing it from GitHub.
+- [x] Display the Project's existing Iteration field without managing sprints.
+- [x] Document and validate the required `project` token scope (`gh auth refresh -s project`).
+- [x] Add optional, non-blocking WIP limits per status column.
+- [x] Show time in status from GitHub's Project timeline, with a configurable highlight threshold.
 
 ### Attention queue
 

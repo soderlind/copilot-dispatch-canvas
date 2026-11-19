@@ -21,6 +21,7 @@ The folder name must be `team-load` and the entry file is `extension.mjs`. It ne
 - **Needs an owner**: open, unassigned issues in the tracked repos, each with one-click assign to a person or to Copilot.
 - **Bulk local sessions**: tick issues in Needs an owner (or in an expanded person's list; the checkbox appears over the issue icon on hover), or use the select-all box, then **Start N Copilot sessions**. Up to 10 at a time. This does not assign the Copilot coding agent on GitHub; it assigns you and asks the hosting conversation to start one local Copilot coding session per issue. Those rows swap their issue icon for an animated Copilot icon ("Copilot session starting") for a few minutes. Escape clears the selection.
 - **Momentum**: daily commits, PRs opened and merged, and issues opened and completed across the tracked repos, drawn in the load-meter palette. It shows 7 days by default (or 30 / 90), for the whole team, one person or everyone, across all repos or just one. Hover a day for its numbers; the play button replays the animation. Days are UTC.
+- **Board**: a kanban view of issues and PRs in a shared GitHub Project. Drag a card or use its **Move to…** menu. Click the title to open its in-canvas detail.
 - **Person profile** (`#person/<login>`): that person's Momentum over time, plus everything currently assigned to them and an Open on GitHub link. Copilot has a profile too. Contributions cover the tracked repos only, not their GitHub-wide activity.
 - Clicking any issue or PR opens it inside the canvas. You get the title, state, labels, assignees, the rendered body and the latest comments, plus Back and Open on GitHub. In tracked repos the view is editable: add or remove assignees (Copilot only on issues), toggle labels from the gear menu, post a Markdown comment (Cmd/Ctrl+Enter), delete your own comments, and close or reopen the issue or PR ("Close with comment" when there's a draft). Drafts survive refreshes and navigation until the page reloads.
 
@@ -45,6 +46,22 @@ The folder name must be `team-load` and the entry file is `extension.mjs`. It ne
 Before writing, it checks for conflicts: the issue is closed or a PR. Without `additional`, an already-assigned issue is also a conflict, which keeps Needs an owner a safe triage action; adding to an assigned issue is an explicit choice made from the issue's Assignees list. After each write it refreshes.
 
 Moving also verifies that the source still owns the issue. If the target cannot be assigned, the source is not removed. If removing the source fails, the partial change is reported explicitly and the canvas refreshes; it never reports a successful move without verifying both assignments. Undo preserves a target who was already a co-assignee.
+
+## Board setup
+
+The Board needs the `gh` token's **write `project` scope** in addition to repository access:
+
+```bash
+gh auth refresh -h github.com -s project
+```
+
+If `GH_TOKEN` or `GITHUB_TOKEN` overrides your CLI login, replace it with a token with the required access or unset it. For organization Projects, check SSO authorization and Project write access as well.
+
+Open **Board** and link an editable GitHub Project with a single-select `Status` field. The canvas checks the tracked repo owners and the signed-in user's Projects. Reuse an existing Project if it fits your repos. If none of the listed Projects fit, choose to create one under the common repo owner, or choose an owner when repos have different owners. Creation requires explicit confirmation. Each global or Copilot Project tracking scope stores its own link and Board settings.
+
+Linking adds open issues and PRs from tracked repos. Refresh adds new open work automatically while the canvas is active. Untracking a repo hides its cards without removing anything from the GitHub Project. Moving a card changes only its Project Status. Closed and merged work stays in the status GitHub reports and gets a badge; workflows configured in GitHub can still change or archive items independently. If an Iteration field exists, the Board shows its values but never manages sprints.
+
+In **Board settings**, leave WIP limits blank to disable them. Limits count open, unarchived cards and warn at or above the limit without blocking moves. Cards are highlighted after seven days in status by default. Age comes from GitHub's status-change timeline; if the exact date can't be established, the card says **Status age unavailable**.
 
 ## Data
 
@@ -91,6 +108,8 @@ cd ~/.copilot/extensions/team-load && node --test tests/
 ```
 
 Tests mock `gh`; they never touch GitHub. Client request-state tests use minimal DOM fixtures and deferred responses to cover bulk controls, navigation during edits, label Undo, Momentum selection changes, tracking races, and same-selection stale-data fallback without browser dependencies. Project detection is tested against fixture `events.jsonl` files.
+
+The optional Board browser regression uses Playwright and the real loopback server with a stubbed GitHub adapter. With Playwright and its Chromium browser installed, run `node --test tests/board-browser.mjs`. Set `PLAYWRIGHT_CHROME_CHANNEL=chrome` to use an installed Google Chrome instead.
 
 Planned work is in [TODO.md](TODO.md).
 
