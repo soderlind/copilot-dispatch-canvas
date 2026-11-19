@@ -1,0 +1,1476 @@
+import { AGENT, canonLogin, computeLoad, loadOf, tone, meterScale, sortRoster, sortForAssign, ago, shortRepo, parseItemUrl, loginPattern, repoPattern, isRepoGlob, globMatcher, labelSummary, planRowUpdate } from "/model.mjs";
+import { ICONS } from "/icons.mjs";
+import { sanitizeHtml } from "/markdown.mjs";
+import { createMomentumPanel } from "/momentum.mjs";
+
+const $ = id => document.getElementById(id);
+const root = document.documentElement;
+const nonce = document.querySelector('meta[name="team-load-nonce"]').content;
+const icon = (name, cls = "") => `<svg class="octicon ${cls}" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
+const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const keyOf = item => `${item.repository}#${item.number}`;
+const splitKey = key => { const i = key.lastIndexOf("#"); return { repository: key.slice(0, i), number: Number(key.slice(i + 1)) }; };
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const firstName = person => person.agent ? "Copilot" : (person.name || person.login).split(" ")[0];
+
+// ---- Theme ----
+const media = matchMedia("(prefers-color-scheme: dark)");
+function applyTheme() {
+    if (!root.hasAttribute("data-theme-locked")) root.dataset.theme = media.matches ? "dark" : "light";
+    const dark = root.dataset.theme === "dark";
+    const toggle = $("theme-toggle");
+    toggle.innerHTML = icon(dark ? "sun" : "moon");
+    toggle.setAttribute("aria-label", `Switch to ${dark ? "light" : "dark"} theme`);
+    toggle.title = toggle.getAttribute("aria-label");
+}
+applyTheme();
+media.addEventListener("change", () => { applyTheme(); paintLabels(document); });
+
+// ---- Server ----
+async function post(action, input = {}) {
+    const response = await fetch("/api/action", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-team-load-nonce": nonce },
+        body: JSON.stringify({ action, input }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const error = new Error(body.error || `Request failed (${response.status}).`);
+        error.code = body.code;
+        throw error;
+    }
+    return body;
+}
+
+// ---- State ----
+let S = null;           // server state
+let people = [];        // computed roster
+let byLogin = new Map();
+let unowned = [];
+let directory = new Map();
+const openRows = new Set();
+let openPicker = null;  // item key
+let pickQ = "";
+const busy = new Set(); // item keys mid-write
+let lastError = null;
+let movingIssue = null;
+const drafts = new Map();     // item key -> unsent comment text
+const labelLists = new Map(); // lower(repo) -> labels[] | { error }
+let labelQ = "";
+const inDetail = k => k.startsWith("detail:") || k.startsWith("labels:");
+// Bulk "start local Copilot sessions": selected issue keys, and keys whose sessions were just requested.
+const MAX_BATCH = 10;
+const STARTING_TTL = 15 * 60e3;
+const selected = new Set();
+let bulkBusy = false;
+const starting = (() => {
+    try { return new Map(Object.entries(JSON.parse(localStorage.getItem("team-load-starting") ?? "{}")).filter(([, t]) => Date.now() - t < STARTING_TTL)); }
+    catch { return new Map(); }
+})();
+const saveStarting = () => { try { localStorage.setItem("team-load-starting", JSON.stringify(Object.fromEntries(starting))); } catch {} };
+const isStarting = key => Date.now() - (starting.get(key) ?? 0) < STARTING_TTL;
+// Replaces the row's issue icon so the status costs no width.
+const startingIcon = () => `<span class="starting" role="img" aria-label="Copilot session starting" title="Copilot session starting">${icon("copilot")}</span>`;
+function selBox(key, title) {
+    const n = splitKey(key).number;
+    return `<input type="checkbox" class="sel" data-select="${esc(key)}" aria-label="Select #${n} ${esc(title)}"${selected.has(key) ? " checked" : ""}${busy.has(key) || bulkBusy ? " disabled" : ""}>`;
+}
+
+function compute() {
+    if (!S) return;
+    directory = new Map(S.directory.people.map(p => [p.login, p]));
+    const profiles = Object.fromEntries(S.directory.people.map(p => [p.login, p]));
+    const load = computeLoad({ items: S.items, people: S.tracking.people, profiles });
+    people = load.people;
+    byLogin = new Map(people.map(p => [p.login, p]));
+    unowned = load.unowned;
+}
+
+const limit = () => S?.limit ?? 6;
+const scale = () => meterScale(people.map(p => p.items.length), limit());
+const repoLoading = () => S && S.tracking.repos.some(r => (S.repoStatus[r]?.status ?? "loading") === "loading");
+const repoPartial = () => !!S && S.tracking.repos.some(r => ["error", "stale"].includes(S.repoStatus[r]?.status));
+
+// ---- Pieces ----
+function avatarHTML(person, size = 32) {
+    if (person.agent) return `<span class="avatar avatar--agent avatar-${size}">${icon("copilot")}</span>`;
+    const initials = (person.name || person.login).split(/\s+/).map(s => s[0]).join("").slice(0, 2).toUpperCase();
+    const src = person.avatarUrl || `https://avatars.githubusercontent.com/${encodeURIComponent(person.login)}?s=64`;
+    return `<img class="avatar avatar-${size}" width="${size}" height="${size}" src="${esc(src)}" alt="" data-initials="${esc(initials)}">`;
+}
+document.addEventListener("error", event => {
+    const img = event.target;
+    if (!(img instanceof HTMLImageElement) || !img.dataset.initials) return;
+    const span = document.createElement("span");
+    span.className = `${img.className} avatar--initials`;
+    span.textContent = img.dataset.initials;
+    img.replaceWith(span);
+}, true);
+
+function meterHTML(person, s) {
+    const n = person.items.length;
+    const t = tone(n, { agent: person.agent, limit: limit() });
+    let cells = "";
+    for (let i = 1; i <= s; i++) cells += `<span class="cell${i <= n ? " on" : ""}${i === limit() ? " is-limit" : ""}"></span>`;
+    return `<span class="meter tone-${t.key}" aria-hidden="true">${cells}</span>`;
+}
+
+function labelHTML(label) {
+    return `<span class="IssueLabel" data-color="${esc(label.color)}">${esc(label.name)}</span>`;
+}
+function labelsHTML(labels) {
+    const { shown, more, title } = labelSummary(labels);
+    if (!shown.length) return "";
+    return `<span class="lbls" title="${esc(title)}"><span class="sr-only">Labels: ${esc(title)}</span><span class="lbls-pills" aria-hidden="true">${shown.map(labelHTML).join("")}</span>${more ? `<span class="lbl-more" aria-hidden="true">+${more}</span>` : ""}</span>`;
+}
+function paintLabels(scope) {
+    const dark = root.dataset.theme === "dark";
+    for (const el of scope.querySelectorAll(".IssueLabel[data-color]")) {
+        const hex = el.dataset.color;
+        const [r, g, b] = [0, 2, 4].map(i => parseInt(hex.slice(i, i + 2), 16));
+        const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        el.style.setProperty("background", dark ? `rgba(${r},${g},${b},.18)` : `#${hex}`);
+        el.style.setProperty("color", dark ? `rgb(${Math.min(255, r + 60)},${Math.min(255, g + 60)},${Math.min(255, b + 60)})` : lum > 0.6 ? "#1f2328" : "#fff");
+        el.style.setProperty("border-color", dark ? `rgba(${r},${g},${b},.3)` : "transparent");
+    }
+    for (const el of scope.querySelectorAll(".label-dot[data-color]")) el.style.setProperty("background", `#${el.dataset.color}`);
+}
+
+function kindIcon(item) {
+    if (item.kind === "issue") return icon("issue-opened", "ic-issue");
+    if (item.kind === "review") return icon("eye", "ic-review");
+    return item.isDraft ? icon("git-pull-request-draft", "ic-draft") : icon("git-pull-request", "ic-pr");
+}
+
+// ---- Render: header ----
+function renderMeta() {
+    const np = S.tracking.people.length, nr = S.tracking.repos.length;
+    const btn = $("scope-btn");
+    btn.innerHTML = `${icon("people")}<b>${np}</b> ${np === 1 ? "person" : "people"}<span class="sep">·</span>${icon("repo")}<b>${nr}</b> ${nr === 1 ? "repo" : "repos"}${icon("triangle-down")}`;
+    btn.setAttribute("aria-label", `Tracking ${np} people and ${nr} repos. Change`);
+    const time = S.updatedAt ? new Date(S.updatedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+    $("updated").textContent = S.refreshing ? " · Updating…" : time ? ` · Updated ${time}` : "";
+    const refresh = $("refresh");
+    refresh.classList.toggle("is-spinning", !!S.refreshing);
+    refresh.disabled = !!S.refreshing;
+
+    const humans = people.filter(p => !p.agent);
+    const free = humans.filter(p => p.items.length === 0).map(firstName);
+    const over = humans.filter(p => p.items.length > limit()).map(firstName);
+    const parts = [];
+    if (repoPartial()) parts.push(`<span><i class="dot dot-over"></i>Counts may be incomplete</span>`);
+    else if (!repoLoading()) {
+        if (free.length) parts.push(`<span><i class="dot dot-free"></i><b>${esc(free.join(", "))}</b> free</span>`);
+        if (over.length) parts.push(`<span><i class="dot dot-over"></i><b>${esc(over.join(", "))}</b> over limit</span>`);
+    }
+    $("insight").innerHTML = parts.join("");
+
+    const failed = S.tracking.repos.filter(r => ["error", "stale"].includes(S.repoStatus[r]?.status));
+    const notice = $("notice");
+    const messages = [];
+    if (lastError) messages.push(esc(lastError));
+    for (const r of failed) messages.push(`<b>${esc(shortRepo(r))}</b>: ${esc(S.repoStatus[r].error?.message || "couldn’t load")}${S.repoStatus[r].fetchedAt ? " (showing last good data)" : ""}`);
+    notice.hidden = !messages.length;
+    notice.innerHTML = messages.length ? `${icon("alert")}<div>${messages.join("<br>")}</div>` : "";
+}
+
+// ---- Render: roster ----
+function skeletonRows(n) {
+    return Array.from({ length: n }, () => `<li class="skel-row" aria-hidden="true"><span class="skeleton round"></span><span class="skeleton"></span><span class="skeleton"></span></li>`).join("");
+}
+
+// A person's open work: a type mix line plus the items. Shared by the roster rows and the profile.
+function itemsHTML(p, { movable = false } = {}) {
+    if (!p.items.length) return `<div class="empty-note">${p.agent ? "No agent sessions running." : "Nothing on their plate right now."}</div>`;
+    const counts = { issue: 0, pr: 0, review: 0 };
+    p.items.forEach(i => counts[i.kind]++);
+    return `<div class="mix">
+      ${counts.issue ? `<span>${icon("issue-opened")} ${plural(counts.issue, "issue")}</span>` : ""}
+      ${counts.pr ? `<span>${icon("git-pull-request")} ${counts.pr} PR${counts.pr === 1 ? "" : "s"}</span>` : ""}
+      ${counts.review ? `<span>${icon("eye")} ${plural(counts.review, "review")}</span>` : ""}
+    </div>
+    <ul class="items">${p.items.map(i => {
+        const key = keyOf(i);
+        const canMove = movable && i.kind === "issue";
+        const canSelect = movable && i.kind === "issue";
+        return `<li${canSelect ? ` class="sel-row${selected.has(key) ? " is-selected" : ""}"` : ""}>${canSelect ? selBox(key, i.title) : ""}<a class="item" href="${esc(i.url)}" data-item="${esc(key)}" draggable="${canMove && !busy.has(key)}"${canMove ? ` data-move-key="${esc(key)}" data-move-from="${esc(p.login)}" aria-describedby="move-help" aria-busy="${busy.has(key)}"` : ""}>
+      ${i.kind === "issue" && isStarting(key) ? startingIcon() : kindIcon(i)}
+      <span class="item-title">${esc(i.title)}</span>${labelsHTML(i.labels) || `<span class="lbls"></span>`}
+      <span class="item-meta">${esc(shortRepo(i.repository))} #${i.number} · ${ago(i.updatedAt)}</span></a></li>`;
+    }).join("")}</ul>`;
+}
+
+let rosterRows = [];
+// A re-render between pointerdown and pointerup swaps the row out from under the pointer, so the browser never fires the click.
+// Hold background renders while a pointer is down in the roster and catch up once it lifts.
+let rosterHeld = false, rosterPending = false, rosterHoldTimer = 0;
+function holdRoster(event) {
+    if (event.button !== 0 || !event.target.closest?.("#roster")) return;
+    rosterHeld = true;
+    // A pointerup outside the panel never reaches us; don't let that freeze the list.
+    clearTimeout(rosterHoldTimer);
+    rosterHoldTimer = setTimeout(releaseRoster, 4000);
+}
+function releaseRoster() {
+    if (!rosterHeld) return;
+    rosterHeld = false;
+    clearTimeout(rosterHoldTimer);
+    // Let the click that follows pointerup run against the current rows first.
+    if (rosterPending) setTimeout(() => { if (!rosterHeld && rosterPending) { renderRoster(); fitNow(); } });
+}
+document.addEventListener("pointerdown", holdRoster, true);
+document.addEventListener("pointerup", releaseRoster, true);
+document.addEventListener("pointercancel", releaseRoster, true);
+window.addEventListener("blur", releaseRoster);
+function renderRoster() {
+    if (rosterHeld) { rosterPending = true; return; }
+    rosterPending = false;
+    if (movingIssue) endMove("Move cancelled because the team data changed.");
+    const el = $("roster");
+    const loading = !S.items.length && repoLoading();
+    el.setAttribute("aria-busy", String(!!loading));
+    if (!people.length) {
+        rosterRows = [];
+        if (!S.tracking.repos.length) {
+            el.innerHTML = `<li class="all-clear is-empty">${icon("repo")}<strong>No repositories tracked</strong><span>${S.project ? "Repositories added to this Project are tracked automatically. You can also choose them yourself." : "The team is everyone who can be assigned in the repos you track."}</span><button class="btn" type="button" data-open-scope="repos">${icon("plus")}Choose repositories</button></li>`;
+        } else if (S.refreshing) {
+            el.setAttribute("aria-busy", "true");
+            el.innerHTML = skeletonRows(3);
+        } else {
+            el.innerHTML = `<li class="all-clear"><strong>No one to show</strong><span>${S.tracking.hidden.length ? "Everyone in the tracked repos is hidden." : "No assignable people were found in the tracked repos."}</span>${S.tracking.hidden.length ? `<button class="btn" type="button" data-open-scope="people">Show people</button>` : ""}</li>`;
+        }
+        return;
+    }
+    if (loading) { el.innerHTML = skeletonRows(Math.min(people.length, 6)); return; }
+    const s = scale();
+    const rows = sortRoster(people).map(p => {
+        const n = p.items.length;
+        const t = tone(n, { agent: p.agent, limit: limit() });
+        const open = openRows.has(p.login);
+        const latest = p.items[0];
+        const id = `d-${p.login}`;
+        // The row is a div: its toggle button stretches over it (see .person-toggle::after), so the profile link can sit beside the name without nesting a link in a button.
+        const html = `<li class="person${p.agent ? " is-agent" : ""}${open ? " is-open" : ""}" data-login="${esc(p.login)}">
+      <div class="person-row">
+        ${avatarHTML(p)}
+        <span class="who">
+          <span class="name-line">
+            <button class="person-toggle" type="button" aria-expanded="${open}" aria-controls="${id}"
+              aria-label="${esc(p.name)}, ${plural(n, "open item")}, ${esc(t.label)}"><span class="name">${esc(p.name)}</span></button>
+            <a class="person-open tip" href="${esc(personHash(p.login))}" data-person="${esc(p.login)}" aria-label="Open ${esc(p.name)}’s profile">${icon("arrow-up-right")}</a>
+          </span>
+          <span class="state tone-${t.key}">${esc(t.label)}</span>
+        </span>
+        ${meterHTML(p, s)}
+        <span class="count${n ? "" : " is-zero"}">${n}</span>
+        <span class="now">${latest ? `<span class="num">#${latest.number}</span> <span class="t">${esc(latest.title)}</span>` : "Nothing assigned"}</span>
+        <span class="chev-box" aria-hidden="true">${icon("chevron-down", "chev")}</span>
+      </div>
+      <div class="detail" id="${id}" ${open ? "" : "hidden"}>${itemsHTML(p, { movable: true })}</div>
+    </li>`;
+        return { key: p.login, html };
+    });
+    const lis = [...el.children];
+    const plan = lis.length === rosterRows.length && lis.every(li => li.classList.contains("person")) ? planRowUpdate(rosterRows, rows) : null;
+    if (plan) {
+        for (const i of plan) {
+            lis[i].insertAdjacentHTML("afterend", rows[i].html);
+            const fresh = lis[i].nextElementSibling;
+            lis[i].remove();
+            paintLabels(fresh);
+        }
+    } else {
+        el.innerHTML = rows.map(r => r.html).join("");
+        paintLabels(el);
+    }
+    rosterRows = rows;
+}
+
+// ---- Render: triage + assign popover ----
+// Logins already on an issue that is open in the detail view (the triage list only ever holds unassigned issues).
+function assignedTo(key) {
+    const d = route.item === key && route.data && !route.data.error ? route.data : null;
+    return new Set((d?.assignees ?? []).map(a => canonLogin(a.login)));
+}
+function pickListHTML(key) {
+    const s = scale();
+    const q = pickQ.trim().replace(/^@/, "").toLowerCase();
+    const match = p => !q || `${p.login} ${p.name}`.toLowerCase().includes(q);
+    const taken = assignedTo(key);
+    // Copilot and "start a session" only make sense for issues.
+    const pr = route.item === key && route.data?.kind === "pr";
+    const { humans: allHumans, agent: maybeAgent } = sortForAssign(people);
+    const humans = allHumans.filter(p => !taken.has(canonLogin(p.login)));
+    const agent = !pr && maybeAgent && !taken.has(canonLogin(maybeAgent.login)) ? maybeAgent : null;
+    const row = (p, sub) => {
+        const t = tone(p.items.length, { agent: p.agent, limit: limit() });
+        return `<li><button class="pick" type="button" data-assign="${esc(p.login)}" data-key="${esc(key)}" aria-label="Assign to ${esc(p.name)}, ${p.items.length} open, ${esc(t.label)}">
+      ${avatarHTML(p, 20)}
+      <span class="pick-name"><span class="n">${esc(p.name)}${sub ? ` <small>${sub}</small>` : ""}</span></span>
+      ${meterHTML(p, s)}<span class="pick-count tone-${t.key}">${p.items.length}</span></button></li>`;
+    };
+    let html = humans.filter(match).map(p => row(p)).join("");
+    if (agent && match(agent)) html += `<li class="pick-sep" role="presentation"></li>${row(agent, "agent")}`;
+    if (!pr && (!q || "start a session myself me".includes(q))) html += `<li class="pick-sep" role="presentation"></li><li><button class="pick pick-plain" type="button" data-session="${esc(key)}">${icon("play")}<span class="pick-name"><span class="n">Start a session myself</span></span></button></li>`;
+    return html || `<li class="sp-empty">No one matches</li>`;
+}
+function pickerHTML(key) {
+    const adding = assignedTo(key).size > 0;
+    return `<div class="picker" role="dialog" aria-label="${adding ? "Add assignee" : "Assign"}" data-key="${esc(key)}">
+    <div class="picker-head">${adding ? "Add assignee" : "Assign to"} · lightest load first</div>
+    <div class="sp-search">${icon("search")}<input class="pick-q" type="text" placeholder="Filter people" aria-label="Filter people" autocomplete="off" value="${esc(pickQ)}"></div>
+    <ul class="pick-list">${pickListHTML(key)}</ul>
+  </div>`;
+}
+
+function renderTriage() {
+    const el = $("tickets");
+    const loading = !S.items.length && repoLoading();
+    el.setAttribute("aria-busy", String(!!loading));
+    $("triage-count").textContent = loading ? "" : unowned.length;
+    renderBulk();
+    if (loading) { el.innerHTML = skeletonRows(3); return; }
+    if (!unowned.length && repoPartial()) {
+        el.innerHTML = `<li class="all-clear">${icon("alert")}<strong>Some repos couldn’t load</strong><span>Unowned work there isn’t shown.</span></li>`;
+        return;
+    }
+    if (!unowned.length) {
+        el.innerHTML = `<li class="all-clear">${icon("check-circle")}<strong>Everything has an owner</strong><span>New unassigned work will show up here.</span></li>`;
+        return;
+    }
+    el.innerHTML = unowned.map(it => {
+        const key = keyOf(it);
+        const open = openPicker === key;
+        return `<li class="ticket${open ? " is-picking" : ""}${busy.has(key) ? " is-busy" : ""}${selected.has(key) ? " is-selected" : ""}" data-key="${esc(key)}">
+      <span class="sel-slot">${isStarting(key) ? startingIcon() : icon("issue-opened")}${selBox(key, it.title)}</span>
+      <div class="ticket-body">
+        <a class="ticket-title" href="${esc(it.url)}" data-item="${esc(key)}" title="${esc(it.title)}">${esc(it.title)}</a>
+        <div class="ticket-meta"><span>${esc(shortRepo(it.repository))} #${it.number} · ${ago(it.updatedAt)}</span>${labelsHTML(it.labels)}</div>
+      </div>
+      <div class="ticket-actions">
+        <button class="btn-icon tip is-assign" type="button" data-open-picker="${esc(key)}" aria-expanded="${open}" aria-label="Assign">${icon("person-add")}</button>
+        <button class="btn-icon tip" type="button" data-assign="${AGENT}" data-key="${esc(key)}" aria-label="Assign to Copilot">${icon("copilot")}</button>
+      </div>
+      ${open ? pickerHTML(key) : ""}
+    </li>`;
+    }).join("");
+    paintLabels(el);
+    wirePicker(el);
+}
+
+// ---- Bulk selection ----
+function selectableTitles() {
+    const titles = new Map(unowned.map(i => [keyOf(i), i.title]));
+    for (const p of people) for (const i of p.items) if (i.kind === "issue" && !titles.has(keyOf(i))) titles.set(keyOf(i), i.title);
+    return titles;
+}
+function renderBulk() {
+    const all = $("triage-all");
+    const keys = unowned.map(keyOf);
+    const on = keys.filter(k => selected.has(k)).length;
+    all.hidden = !keys.length;
+    all.checked = !!keys.length && on === keys.length;
+    all.indeterminate = on > 0 && on < keys.length;
+    all.disabled = bulkBusy;
+    document.body.classList.toggle("is-selecting", selected.size > 0);
+    const bar = $("bulkbar");
+    const n = selected.size;
+    bar.hidden = !n;
+    if (!n) return;
+    const over = n > MAX_BATCH;
+    bar.innerHTML = `<span class="bulk-count"><b>${n}</b> selected${over ? ` · max ${MAX_BATCH}` : ""}</span>
+      <button class="btn btn-invisible" type="button" data-bulk="clear"${bulkBusy ? " disabled" : ""}>Clear</button>
+      <button class="btn btn-primary" type="button" data-bulk="start"${over || bulkBusy ? " disabled" : ""}>${icon("copilot")}${bulkBusy ? "Starting…" : `Start ${n} Copilot session${n === 1 ? "" : "s"}`}</button>`;
+}
+function setSelected(keys, on) {
+    for (const key of keys) on ? selected.add(key) : selected.delete(key);
+    renderRoster();
+    renderTriage();
+    fitNow();
+}
+function pruneSelection() {
+    const titles = selectableTitles();
+    for (const key of selected) if (!titles.has(key)) selected.delete(key);
+}
+async function startSessions() {
+    if (bulkBusy || !selected.size || selected.size > MAX_BATCH) return;
+    const titles = selectableTitles();
+    const keys = [...selected].filter(k => titles.has(k));
+    if (!keys.length) return;
+    hideToast();
+    bulkBusy = true;
+    keys.forEach(k => busy.add(k));
+    renderAll();
+    try {
+        const result = await post("start_sessions", { items: keys.map(k => ({ ...splitKey(k), title: titles.get(k) })) });
+        S = result.state;
+        const now = Date.now();
+        keys.forEach(k => { starting.set(k, now); selected.delete(k); });
+        saveStarting();
+        toast(`Asked Copilot to start ${plural(keys.length, "session")}`);
+        if (result.login) flash(canonLogin(result.login));
+    } catch (error) {
+        toast(esc(error.message), { error: true });
+    } finally {
+        bulkBusy = false;
+        keys.forEach(k => busy.delete(k));
+        renderAll();
+    }
+}
+
+function wirePicker(scope) {
+    const input = scope.querySelector(".picker .pick-q");
+    if (!input) return;
+    const list = input.closest(".picker").querySelector(".pick-list");
+    const key = input.closest(".picker").dataset.key;
+    input.addEventListener("input", e => { pickQ = e.target.value; list.innerHTML = pickListHTML(key); });
+    input.addEventListener("keydown", e => {
+        if (e.key === "Enter") { e.preventDefault(); list.querySelector(".pick")?.click(); }
+        if (e.key === "ArrowDown") { e.preventDefault(); list.querySelector(".pick")?.focus(); }
+    });
+}
+
+// Hide the "current item" column when it would be too narrow to read.
+function fitNow() {
+    const r = $("roster");
+    r.classList.remove("no-now");
+    const now = r.querySelector(".now");
+    if (now && getComputedStyle(now).display !== "none" && now.getBoundingClientRect().width < 200) r.classList.add("no-now");
+}
+new ResizeObserver(() => fitNow()).observe($("roster"));
+
+function renderAll() {
+    if (!S) return;
+    compute();
+    pruneSelection();
+    renderMeta();
+    renderRoster();
+    renderTriage();
+    fitNow();
+    if (scope.open) renderScope();
+    if (route.item) renderDetailSide();
+    if (route.person) paintPerson();
+}
+
+// ---- Data loading ----
+let pollTimer = null;
+let autoTimer = null;
+async function load(action = "get_state", input = {}) {
+    try {
+        const next = await post(action, input);
+        if (!S || next.revision !== S.revision || next.refreshing !== S.refreshing || action !== "get_state") { S = next; renderAll(); syncMomentum(); }
+        lastError = null;
+    } catch (error) {
+        lastError = error.message;
+        if (S) renderMeta(); else showFatal(error.message);
+    }
+    schedule();
+}
+function schedule() {
+    clearTimeout(pollTimer);
+    clearTimeout(autoTimer);
+    if (S?.refreshing) { pollTimer = setTimeout(() => load(), 1500); return; }
+    const seconds = Math.max(60, S?.refreshSeconds ?? 300);
+    autoTimer = setTimeout(() => { if (document.visibilityState === "visible") load("refresh", {}); else schedule(); }, seconds * 1000);
+}
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && S?.updatedAt && Date.now() - new Date(S.updatedAt) > (S.refreshSeconds ?? 300) * 1000) load("refresh", {});
+});
+function showFatal(message) {
+    $("roster").innerHTML = `<li class="all-clear">${icon("alert")}<strong>Couldn’t load team data</strong><span>${esc(message)}</span></li>`;
+    $("tickets").innerHTML = "";
+    $("notice").hidden = true;
+}
+
+// ---- Toast ----
+let toastTimer;
+let undoAction = null;
+function toast(html, { undo = null, error = false } = {}) {
+    const el = $("toast");
+    undoAction = undo;
+    el.classList.toggle("is-error", error);
+    el.innerHTML = `${icon(error ? "alert" : "check")}<span>${html}</span>${undo ? `<button type="button" id="undo">Undo</button>` : ""}`;
+    el.classList.add("is-on");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.classList.remove("is-on"); undoAction = null; }, error ? 7000 : 6000);
+}
+function hideToast() { $("toast").classList.remove("is-on"); undoAction = null; }
+
+function flash(login) {
+    const li = document.querySelector(`.person[data-login="${CSS.escape(login)}"]`);
+    if (!li) return;
+    li.classList.add("is-flash");
+    setTimeout(() => li.classList.remove("is-flash"), 900);
+}
+
+// ---- Writes ----
+const whoLabel = login => login === AGENT ? "Copilot" : directory.get(login)?.name || login;
+// Mirrors the server: only Copilot, me and tracked people can be added, while anyone can be removed.
+const addable = login => { const c = canonLogin(login); return c === AGENT || c === S?.me || !!S?.directory.people.some(p => p.inRepos && p.login === c); };
+const personRef = login => ({ login, name: directory.get(login)?.name || login, avatarUrl: directory.get(login)?.avatarUrl ?? null, agent: login === AGENT });
+// Reflect a write in the open issue straight away; the quiet refetch that follows swaps in GitHub's copy.
+function applyAssignees(key, logins) {
+    const d = route.item === key ? route.data : null;
+    if (!d || d.error || !Array.isArray(logins)) return;
+    const known = new Map(d.assignees.map(a => [canonLogin(a.login), a]));
+    d.assignees = logins.map(login => known.get(canonLogin(login)) ?? personRef(canonLogin(login)));
+}
+
+async function assign(key, login, { session = false, restore = false } = {}) {
+    if (busy.has(key)) return;
+    const ref = splitKey(key);
+    const viewing = route.item === key && route.data && !route.data.error ? route.data : null;
+    // Triage keeps the server's "already assigned" guard; only an issue seen with assignees (or an undo) may be added to.
+    const extra = restore || viewing?.assignees.length || viewing?.kind === "pr" ? { additional: true } : {};
+    const title = unowned.find(i => keyOf(i) === key)?.title ?? viewing?.title ?? "";
+    const who = whoLabel(login);
+    busy.add(key);
+    openPicker = null;
+    renderTriage();
+    renderDetailSide();
+    try {
+        const result = session
+            ? await post("start_session", { ...ref, title, ...extra })
+            : await post("assign", { ...ref, login, ...extra });
+        S = result.state;
+        busy.delete(key);
+        applyAssignees(key, result.assignees);
+        renderAll();
+        const assignee = result.login ?? login;
+        flash(canonLogin(assignee));
+        const msg = session ? `Session started on <b>#${ref.number}</b>`
+            : restore ? `Restored ${esc(who)} on <b>#${ref.number}</b>`
+            : extra.additional ? `Added ${esc(who)} to <b>#${ref.number}</b>`
+            : login === AGENT ? `Copilot is on <b>#${ref.number}</b>` : `<b>#${ref.number}</b> → ${esc(who)}`;
+        // Nothing to undo when the person was already on the issue.
+        toast(msg, restore || result.added === false ? {} : { undo: () => unassign(key, assignee) });
+        refreshItem(key);
+    } catch (error) {
+        busy.delete(key);
+        renderTriage();
+        if (route.item === key) renderDetailSide();
+        toast(esc(error.message), { error: true });
+        const conflict = error.code === "conflict";
+        await load(conflict ? "refresh" : "get_state", conflict ? { force: true } : {});
+        if (conflict) refreshItem(key);
+    }
+}
+async function unassign(key, login, { removal = false } = {}) {
+    hideToast();
+    busy.add(key);
+    renderTriage();
+    renderDetailSide();
+    try {
+        const result = await post("unassign", { ...splitKey(key), login });
+        S = result.state;
+        busy.delete(key);
+        applyAssignees(key, result.assignees);
+        renderAll();
+        const number = splitKey(key).number;
+        if (removal) toast(`Removed ${esc(whoLabel(login))} from <b>#${number}</b>`, addable(login) ? { undo: () => assign(key, login, { restore: true }) } : {});
+        else toast(`Undid assignment on <b>#${number}</b>`);
+        refreshItem(key);
+    } catch (error) {
+        busy.delete(key);
+        renderTriage();
+        renderDetailSide();
+        toast(esc(error.message), { error: true });
+    }
+}
+const removeAssignee = (key, login) => unassign(key, login, { removal: true });
+
+// ---- Detail-view edits: comments, labels, close/reopen ----
+const viewingData = key => route.item === key && route.data && !route.data.error ? route.data : null;
+function lock(key) { busy.add(key); renderDetailSide(); }
+function unlock(key) { busy.delete(key); if (route.item === key) renderDetailSide(); }
+
+async function postComment({ thenState = null } = {}) {
+    const key = route.item;
+    if (!key || !viewingData(key) || busy.has(key)) return;
+    const body = $("composer-text")?.value ?? "";
+    if (!body.trim()) { if (thenState) await setItemState(key, thenState); return; }
+    hideToast();
+    lock(key);
+    const number = splitKey(key).number;
+    try {
+        const { comment } = await post("comment", { ...splitKey(key), body });
+        drafts.delete(key);
+        const composer = route.item === key ? $("composer-text") : null;
+        if (composer) composer.value = "";
+        unlock(key);
+        const d = viewingData(key);
+        if (d) { d.comments.nodes.push(comment); d.comments.total++; renderDetail(); }
+        toast(`Comment posted on <b>#${number}</b>`, { undo: () => {
+            if (!drafts.get(key)?.trim()) drafts.set(key, body);
+            removeComment(key, comment.id, { restored: true });
+        } });
+        if (thenState) await setItemState(key, thenState); else refreshItem(key);
+    } catch (error) {
+        unlock(key);
+        toast(esc(error.message), { error: true });
+    }
+}
+
+async function removeComment(key, commentId, { restored = false } = {}) {
+    if (busy.has(key)) return;
+    hideToast();
+    lock(key);
+    try {
+        await post("delete_comment", { ...splitKey(key), commentId });
+        unlock(key);
+        const d = viewingData(key);
+        if (d) {
+            const i = d.comments.nodes.findIndex(c => c.id === commentId);
+            if (i >= 0) { d.comments.nodes.splice(i, 1); d.comments.total = Math.max(0, d.comments.total - 1); }
+            renderDetail();
+        }
+        toast(restored ? "Comment removed, text is back in the box" : "Comment deleted");
+        refreshItem(key);
+    } catch (error) {
+        unlock(key);
+        toast(esc(error.message), { error: true });
+    }
+}
+
+async function setItemState(key, to, { undo = false } = {}) {
+    if (busy.has(key)) return;
+    hideToast();
+    lock(key);
+    const number = splitKey(key).number;
+    try {
+        const result = await post("set_item_state", { ...splitKey(key), state: to });
+        S = result.state;
+        busy.delete(key);
+        const d = viewingData(key);
+        if (d) { d.state = to; d.stateReason = null; }
+        renderAll();
+        if (route.item === key) renderDetail();
+        toast(`${to === "closed" ? "Closed" : "Reopened"} <b>#${number}</b>`, undo ? {} : { undo: () => setItemState(key, to === "closed" ? "open" : "closed", { undo: true }) });
+        refreshItem(key);
+    } catch (error) {
+        unlock(key);
+        toast(esc(error.message), { error: true });
+        refreshItem(key);
+    }
+}
+
+function toggleLabel(key, name) {
+    const d = viewingData(key);
+    if (!d) return;
+    return setLabel(key, name, !d.labels.some(l => l.name.toLowerCase() === name.toLowerCase()));
+}
+
+async function setLabel(key, name, add, { undo = false } = {}) {
+    if (busy.has(key)) return;
+    lock(key);
+    try {
+        const result = await post("label", { ...splitKey(key), label: name, add });
+        S = result.state;
+        busy.delete(key);
+        const now = viewingData(key);
+        if (now) now.labels = result.labels;
+        renderAll();
+        toast(`${add ? "Added" : "Removed"} label <b>${esc(name)}</b>`, undo ? {} : { undo: () => setLabel(key, name, !add, { undo: true }) });
+        refreshItem(key);
+    } catch (error) {
+        unlock(key);
+        toast(esc(error.message), { error: true });
+    }
+}
+
+async function reassignIssue(key, from, login, { undo = false } = {}) {
+    if (busy.has(key) || from === login) return;
+    hideToast();
+    busy.add(key);
+    openPicker = null;
+    renderRoster();
+    renderTriage();
+    renderDetailSide();
+    $("move-status").textContent = `Moving #${splitKey(key).number} to ${whoLabel(login)}.`;
+    try {
+        const result = await post("reassign", { ...splitKey(key), from, login });
+        S = result.state;
+        busy.delete(key);
+        applyAssignees(key, result.assignees);
+        openRows.add(login);
+        renderAll();
+        flash(login);
+        if (!homeEl.hidden) document.querySelector(`.person[data-login="${CSS.escape(login)}"] .person-toggle`)?.focus();
+        toast(`Moved <b>#${splitKey(key).number}</b> from ${esc(whoLabel(from))} to ${esc(whoLabel(login))}`, undo ? {} : {
+            undo: () => result.added
+                ? reassignIssue(key, login, from, { undo: true })
+                : assign(key, from, { restore: true }),
+        });
+        refreshItem(key);
+    } catch (error) {
+        busy.delete(key);
+        renderAll();
+        toast(esc(error.message), { error: true });
+        await load("refresh", { force: true });
+        refreshItem(key);
+    } finally {
+        $("move-status").textContent = "";
+    }
+}
+
+function endMove(message = "") {
+    const move = movingIssue;
+    movingIssue = null;
+    $("roster").classList.remove("is-moving");
+    $("roster").querySelectorAll(".is-drop-target, .is-moving-source").forEach(el => el.classList.remove("is-drop-target", "is-moving-source"));
+    $("move-status").textContent = message;
+    return move;
+}
+
+function moveDestination(node) {
+    const person = node instanceof Element ? node.closest("#roster .person") : null;
+    return movingIssue && !busy.has(movingIssue.key) && person && person.dataset.login !== movingIssue.from
+        && byLogin.has(person.dataset.login) ? person : null;
+}
+
+function highlightDestination(person) {
+    $("roster").querySelectorAll(".is-drop-target").forEach(el => el.classList.remove("is-drop-target"));
+    person?.classList.add("is-drop-target");
+}
+
+function beginMove(link, keyboard = false) {
+    if (!link || busy.has(link.dataset.moveKey) || !byLogin.has(link.dataset.moveFrom)) return false;
+    movingIssue = { key: link.dataset.moveKey, from: link.dataset.moveFrom, keyboard };
+    $("roster").classList.add("is-moving");
+    link.classList.add("is-moving-source");
+    $("move-status").textContent = `Picked up #${splitKey(movingIssue.key).number} from ${whoLabel(movingIssue.from)}. Choose another teammate to move it. Escape cancels.`;
+    if (keyboard) [...$("roster").querySelectorAll(".person")].find(p => moveDestination(p))?.querySelector(".person-toggle")?.focus();
+    return true;
+}
+
+$("roster").addEventListener("dragstart", event => {
+    const link = event.target.closest("[data-move-key]");
+    if (!beginMove(link)) { event.preventDefault(); return; }
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-team-load-issue", movingIssue.key);
+});
+$("roster").addEventListener("dragover", event => {
+    if (!movingIssue || movingIssue.keyboard) return;
+    const person = moveDestination(event.target);
+    highlightDestination(person);
+    event.dataTransfer.dropEffect = person ? "move" : "none";
+    if (person) event.preventDefault();
+});
+$("roster").addEventListener("dragleave", event => {
+    const person = event.target.closest(".person");
+    if (person && !person.contains(event.relatedTarget)) person.classList.remove("is-drop-target");
+});
+$("roster").addEventListener("drop", event => {
+    if (!movingIssue || movingIssue.keyboard) return;
+    event.preventDefault();
+    const person = moveDestination(event.target);
+    const move = endMove();
+    if (person) reassignIssue(move.key, move.from, person.dataset.login);
+});
+document.addEventListener("dragend", () => {
+    if (movingIssue && !movingIssue.keyboard) endMove("Move cancelled.");
+});
+$("roster").addEventListener("focusin", event => {
+    if (movingIssue?.keyboard) highlightDestination(moveDestination(event.target));
+});
+
+// ---- Scope picker (persisted tracking) ----
+// Repos: what the canvas watches. People: everyone assignable in those repos; the checkbox shows or hides them.
+const scope = { open: false, tab: "repos", q: "", order: [], keep: new Set(), saving: false };
+const tracked = tab => new Set(tab === "people" ? S.tracking.people : S.tracking.repos);
+const dirIds = tab => tab === "people" ? S.directory.people.filter(p => p.inRepos).map(p => p.login) : S.directory.repos.map(r => r.nameWithOwner);
+
+function snapshotOrder() {
+    const set = tracked(scope.tab);
+    scope.order = dirIds(scope.tab).sort((a, b) => set.has(b) - set.has(a));
+    scope.keep = new Set(set);
+}
+// The team grows as repo data arrives; fold newcomers in without reshuffling what the user is looking at.
+function syncOrder() {
+    const ids = dirIds(scope.tab);
+    const present = new Set(ids);
+    const set = tracked(scope.tab);
+    const known = new Set(scope.order);
+    scope.order = scope.order.filter(id => present.has(id));
+    for (const id of ids) if (!known.has(id)) { scope.order.push(id); if (set.has(id)) scope.keep.add(id); }
+}
+
+function optHTML(id, set) {
+    const on = set.has(id);
+    if (scope.tab === "people") {
+        const p = directory.get(id) ?? { login: id, name: id };
+        const n = loadOf(S.items, id);
+        return `<li><button class="opt" type="button" role="option" aria-checked="${on}" data-toggle="${esc(id)}" aria-label="${on ? "Hide" : "Show"} ${esc(p.name || id)}"${scope.saving ? " disabled" : ""}>
+      <span class="check">${icon("check")}</span>${avatarHTML(p, 20)}
+      <span class="opt-name">${esc(p.name || id)}${p.agent ? "" : `<small>${esc(id)}</small>`}</span>
+      <span class="opt-meta">${n ? `${n} open` : ""}</span></button></li>`;
+    }
+    const repo = S.directory.repos.find(r => r.nameWithOwner === id);
+    const [own, name] = id.split("/");
+    const meta = repo?.open == null ? "" : repo.open ? `${repo.open} open` : "No open items";
+    return `<li><button class="opt" type="button" role="option" aria-checked="${on}" data-toggle="${esc(id)}"${scope.saving ? " disabled" : ""}>
+    <span class="check">${icon("check")}</span>${icon("repo", "repo-ic")}
+    <span class="opt-name">${esc(name)}<small>${esc(own)}</small></span>
+    <span class="opt-meta">${meta}</span></button></li>`;
+}
+
+function renderScope() {
+    $("scope-note").hidden = !S.project;
+    const people = scope.tab === "people";
+    for (const t of ["people", "repos"]) {
+        const b = $(`tab-${t}`);
+        b.setAttribute("aria-selected", String(scope.tab === t));
+        b.innerHTML = `${t === "people" ? "People" : "Repos"} <span class="Counter">${tracked(t).size}</span>`;
+    }
+    const input = $("scope-q");
+    input.placeholder = people ? "Filter people in tracked repos" : "Filter, or add owner/repo or owner/prefix*";
+    input.setAttribute("aria-label", input.placeholder);
+    syncOrder();
+    const set = tracked(scope.tab);
+    const q = scope.q.trim().replace(/^@/, "").toLowerCase();
+    const glob = !people && isRepoGlob(q) ? globMatcher(q) : null;
+    const label = id => people ? `${id} ${directory.get(id)?.name ?? ""}` : id;
+    const ids = scope.order.filter(id => !q || (glob ? glob.test(id) : label(id).toLowerCase().includes(q)));
+    const on = ids.filter(id => scope.keep.has(id));
+    const off = ids.filter(id => !scope.keep.has(id));
+    let html = "";
+    if (!people && q && !scope.order.some(id => id.toLowerCase() === q) && (glob || repoPattern.test(q))) {
+        html += `<li><button class="opt is-add" type="button" data-add="${esc(q)}"${scope.saving ? " disabled" : ""}>${icon("plus")}<span class="opt-name">${glob ? `Track all repos matching ${esc(q)}` : `Track ${esc(q)}`}</span></button></li>`;
+    }
+    if (on.length) html += `<li class="sp-group" role="presentation">${people ? "Showing" : "Tracking"}</li>${on.map(id => optHTML(id, set)).join("")}`;
+    if (off.length) html += `<li class="sp-group" role="presentation">${people ? "Hidden" : "Your repos"}</li>${off.map(id => optHTML(id, set)).join("")}`;
+    if (!html) {
+        html = people && !S.tracking.repos.length ? `<li class="sp-empty">Track a repository first. Everyone assignable there shows up here.</li>`
+            : people && !scope.order.length ? `<li class="sp-empty">${S.refreshing ? "Loading people…" : "No assignable people in the tracked repos."}</li>`
+            : `<li class="sp-empty">No matches${people ? "" : ". Type owner/repo or owner/prefix* to add one."}</li>`;
+    }
+    $("scope-list").innerHTML = html;
+}
+
+function openScope(tab = scope.tab) {
+    if (!S) return;
+    Object.assign(scope, { open: true, tab, q: "" });
+    snapshotOrder();
+    $("scope-q").value = "";
+    $("scope-status").textContent = "";
+    $("scope").hidden = false;
+    $("scope-backdrop").hidden = false;
+    $("scope-btn").setAttribute("aria-expanded", "true");
+    renderScope();
+    if (!matchMedia("(max-width: 600px)").matches) $("scope-q").focus();
+}
+function closeScope() {
+    if (!scope.open) return;
+    scope.open = false;
+    $("scope").hidden = true;
+    $("scope-backdrop").hidden = true;
+    $("scope-btn").setAttribute("aria-expanded", "false");
+    $("scope-btn").focus();
+}
+
+async function saveTracking(change, { added = null } = {}) {
+    const status = $("scope-status");
+    const before = new Set(S.tracking.repos.map(r => r.toLowerCase()));
+    scope.saving = true;
+    status.classList.remove("is-error");
+    status.textContent = added ? `Finding ${added}…` : "Saving…";
+    renderScope();
+    try {
+        S = await post("set_tracking", change);
+        status.textContent = "";
+        if (added) {
+            const fresh = S.tracking.repos.filter(r => !before.has(r.toLowerCase()));
+            for (const r of fresh) scope.keep.add(r);
+            scope.order = dirIds("repos").sort((a, b) => scope.keep.has(b) - scope.keep.has(a));
+            status.textContent = fresh.length ? `Now tracking ${fresh.length === 1 ? fresh[0] : `${fresh.length} more repos`}.` : "Already tracked.";
+        }
+    } catch (error) {
+        status.classList.add("is-error");
+        status.textContent = error.message;
+    } finally {
+        scope.saving = false;
+        renderAll();
+        syncMomentum();
+        schedule();
+    }
+}
+function toggleTracked(id) {
+    const refocus = () => document.querySelector(`[data-toggle="${CSS.escape(id)}"]`)?.focus();
+    if (scope.tab === "people") {
+        const hidden = new Set(S.tracking.hidden);
+        if (hidden.has(id)) { hidden.delete(id); scope.keep.add(id); } else hidden.add(id);
+        return saveTracking({ hidden: [...hidden] }).then(refocus);
+    }
+    const set = tracked("repos");
+    if (set.has(id)) set.delete(id); else { set.add(id); scope.keep.add(id); }
+    saveTracking({ repos: [...set] }).then(refocus);
+}
+function addTracked(id) {
+    scope.q = "";
+    $("scope-q").value = "";
+    saveTracking({ repos: [...S.tracking.repos, id] }, { added: id }).then(() => $("scope-q").focus());
+}
+$("scope-q").addEventListener("input", e => { scope.q = e.target.value; renderScope(); });
+$("scope-q").addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); document.querySelector("#scope-list .opt:not(:disabled)")?.click(); }
+    if (e.key === "ArrowDown") { e.preventDefault(); document.querySelector("#scope-list .opt")?.focus(); }
+});
+$("scope-backdrop").addEventListener("click", closeScope);
+
+// ---- Views: home, issue / PR detail, person profile ----
+const route = { item: null, person: null, data: null, token: 0 };
+const detailEl = $("detail");
+const personEl = $("person");
+const homeEl = $("home");
+let homeMomentum = null;
+let personMomentum = null;
+// Only the home scroll position is worth keeping, and showRoute restores that itself.
+history.scrollRestoration = "manual";
+
+// Profiles exist for Copilot and for anything shaped like a GitHub login (not other bots).
+const isProfileable = login => { const c = canonLogin(login); return c === AGENT || (!!c && loginPattern.test(c)); };
+const personHash = login => `#person/${encodeURIComponent(canonLogin(login) ?? String(login))}`;
+const githubProfile = login => login === AGENT ? "https://github.com/apps/copilot-swe-agent" : `https://github.com/${encodeURIComponent(login)}`;
+
+function parseHash() {
+    try {
+        const item = /^#item\/([^/]+)\/([^/]+)\/(\d+)$/.exec(location.hash);
+        if (item) return { item: `${decodeURIComponent(item[1])}/${decodeURIComponent(item[2])}#${item[3]}` };
+        const person = /^#person\/([^/]+)$/.exec(location.hash);
+        const login = person && canonLogin(decodeURIComponent(person[1]));
+        if (login && isProfileable(login)) return { person: login };
+    } catch { /* a malformed escape just means home */ }
+    return {};
+}
+function hashFor(key) {
+    const { repository, number } = splitKey(key);
+    const [o, n] = repository.split("/");
+    return `#item/${encodeURIComponent(o)}/${encodeURIComponent(n)}/${number}`;
+}
+const viewOf = ({ item, person }) => item ? `item:${item}` : person ? `person:${person}` : "home";
+
+let homeScroll = 0;
+// pushState never fires popstate or hashchange, so the new view is shown explicitly.
+function navigate(hash) {
+    if (location.hash !== hash) history.pushState({ app: true }, "", hash);
+    showRoute();
+}
+const openDetail = key => navigate(hashFor(key));
+const openPerson = login => navigate(personHash(login));
+function goBack() {
+    // An entry the app pushed has the previous view behind it; a deep link has nothing to go back to, so it goes home.
+    if (history.state?.app) history.back();
+    else { history.replaceState(null, "", location.pathname + location.search); showRoute(); }
+}
+addEventListener("popstate", () => showRoute());
+addEventListener("hashchange", () => showRoute());
+
+function stateBadge(d) {
+    if (d.kind === "pr") {
+        if (d.state === "merged") return `<span class="State State--merged">${icon("git-merge")}Merged</span>`;
+        if (d.state === "closed") return `<span class="State State--prclosed">${icon("git-pull-request-closed")}Closed</span>`;
+        if (d.isDraft) return `<span class="State State--draft">${icon("git-pull-request-draft")}Draft</span>`;
+        return `<span class="State State--open">${icon("git-pull-request")}Open</span>`;
+    }
+    if (d.state === "closed") return d.stateReason === "NOT_PLANNED"
+        ? `<span class="State State--notplanned">${icon("skip")}Closed</span>`
+        : `<span class="State State--closed">${icon("issue-closed")}Closed</span>`;
+    return `<span class="State State--open">${icon("issue-opened")}Open</span>`;
+}
+
+function peopleList(list, { editable = false, key = "", locked = false } = {}) {
+    if (!list.length) return `<span class="side-empty">No one assigned</span>`;
+    return `<ul class="side-people">${list.map(p => {
+        const name = p.agent ? "Copilot" : p.login;
+        const who = isProfileable(p.login)
+            ? `<a class="n" href="${esc(personHash(p.login))}" data-person="${esc(canonLogin(p.login))}">${esc(name)}</a>`
+            : `<span class="n">${esc(name)}</span>`;
+        const remove = editable
+            ? `<button class="btn-icon tip is-remove" type="button" data-unassign="${esc(canonLogin(p.login))}" data-key="${esc(key)}" aria-label="Remove ${esc(name)}"${locked ? " disabled" : ""}>${icon("x")}</button>`
+            : "";
+        return `<li>${avatarHTML({ ...p, name: p.name || p.login }, 20)}${who}${remove}</li>`;
+    }).join("")}</ul>`;
+}
+
+// Rebuilding the detail view or its sidebar replaces the control keyboard focus sits on, which would drop it to <body>.
+// This returns a function that hands focus to a control that survives (the sidebar itself while a write has everything disabled).
+function holdFocus() {
+    const active = document.activeElement;
+    const side = detailEl.querySelector(".dv-side");
+    const keep = active?.id === "dv-back" ? "#dv-back"
+        : active?.id === "composer-text" ? "#composer-text"
+        : side?.contains(active) ? (active.classList.contains("pick-q") ? ".dv-side .pick-q"
+            : active.classList.contains("label-q") ? ".dv-side .label-q"
+            : active.dataset.label ? `.dv-side [data-label="${CSS.escape(active.dataset.label)}"]`
+            : active.dataset.openPicker ? `.dv-side [data-open-picker="${CSS.escape(active.dataset.openPicker)}"]`
+            : ".dv-side [data-open-picker]")
+        : null;
+    const selection = active?.id === "composer-text" ? [active.selectionStart, active.selectionEnd] : null;
+    return () => {
+        if (!keep) return;
+        const el = [keep, ".dv-side [data-open-picker]", ".dv-side"].map(s => detailEl.querySelector(s)).find(el => el && !el.disabled);
+        if (!el || el === document.activeElement) return;
+        el.focus({ preventScroll: true });
+        if (selection && el.id === "composer-text") el.setSelectionRange(...selection);
+    };
+}
+
+function renderDetailSide() {
+    const side = detailEl.querySelector(".dv-side");
+    const d = route.data;
+    if (!side || !d || d.error || !route.item) return;
+    const restoreFocus = holdFocus();
+    const key = route.item;
+    const tracked = isTracked(d);
+    const editable = tracked && d.state === "open";
+    const pickerOpen = openPicker === `detail:${key}`;
+    const labelsOpen = openPicker === `labels:${key}`;
+    const off = busy.has(key) ? " disabled" : "";
+    side.innerHTML = `
+      <div class="side-sec"><h3>Assignees</h3>
+        ${peopleList(d.assignees, { editable, key, locked: busy.has(key) })}
+        ${editable ? `<div class="side-actions">
+          <button class="btn" type="button" data-open-picker="detail:${esc(key)}" aria-expanded="${pickerOpen}"${off}>${icon("person-add")}${d.assignees.length ? "Add" : "Assign"}</button>
+          ${d.kind === "pr" || d.assignees.some(a => a.agent) ? "" : `<button class="btn" type="button" data-assign="${AGENT}" data-key="${esc(key)}"${off}>${icon("copilot")}Copilot</button>`}
+          ${pickerOpen ? pickerHTML(key) : ""}
+        </div>` : ""}
+      </div>
+      <div class="side-sec">
+        <div class="side-head"><h3>Labels</h3>${tracked ? `<button class="btn-icon tip side-edit" type="button" data-open-picker="labels:${esc(key)}" aria-expanded="${labelsOpen}" aria-label="Edit labels"${off}>${icon("gear")}</button>` : ""}
+          ${labelsOpen ? labelPickerHTML(key) : ""}</div>
+        ${d.labels.length ? `<div class="side-labels">${d.labels.map(labelHTML).join("")}</div>` : `<span class="side-empty">None yet</span>`}
+      </div>`;
+    paintLabels(side);
+    wirePicker(side);
+    wireLabelPicker(side);
+    syncComposer();
+    restoreFocus();
+}
+
+// Edits are limited to tracked repositories (the server enforces the same rule).
+const isTracked = d => !!d && !d.error && !!S?.tracking.repos.some(r => r.toLowerCase() === d.repository.toLowerCase());
+
+function labelListHTML(key) {
+    const d = route.item === key ? route.data : null;
+    const list = d && labelLists.get(d.repository.toLowerCase());
+    if (!list) return `<li class="sp-empty">Loading labels…</li>`;
+    if (list.error) return `<li class="sp-empty">${esc(list.error)}</li>`;
+    const on = new Set(d.labels.map(l => l.name.toLowerCase()));
+    const q = labelQ.trim().toLowerCase();
+    const rows = list.filter(l => !q || `${l.name} ${l.description}`.toLowerCase().includes(q));
+    if (!rows.length) return `<li class="sp-empty">${list.length ? "No labels match" : "This repository has no labels"}</li>`;
+    const locked = busy.has(key) ? ` aria-disabled="true"` : "";
+    return rows.map(l => {
+        const checked = on.has(l.name.toLowerCase());
+        return `<li><button class="pick pick-label" type="button" role="menuitemcheckbox" aria-checked="${checked}" data-label="${esc(l.name)}" data-key="${esc(key)}"${locked}>
+        <span class="pick-check">${checked ? icon("check") : ""}</span><span class="label-dot" data-color="${esc(l.color)}"></span>
+        <span class="pick-name"><span class="n">${esc(l.name)}</span>${l.description ? `<small>${esc(l.description)}</small>` : ""}</span></button></li>`;
+    }).join("");
+}
+function labelPickerHTML(key) {
+    return `<div class="picker picker-labels" role="dialog" aria-label="Apply labels" data-key="${esc(key)}">
+    <div class="picker-head">Apply labels</div>
+    <div class="sp-search">${icon("search")}<input class="label-q" type="text" placeholder="Filter labels" aria-label="Filter labels" autocomplete="off" value="${esc(labelQ)}"></div>
+    <ul class="pick-list label-list" role="menu">${labelListHTML(key)}</ul>
+  </div>`;
+}
+function refreshLabelList() {
+    const ul = detailEl.querySelector(".label-list");
+    if (!ul || !route.item) return;
+    ul.innerHTML = labelListHTML(route.item);
+    paintLabels(ul);
+}
+function wireLabelPicker(scope) {
+    const input = scope.querySelector(".picker .label-q");
+    if (!input) return;
+    input.addEventListener("input", e => { labelQ = e.target.value; refreshLabelList(); });
+    input.addEventListener("keydown", e => {
+        const first = scope.querySelector(".label-list .pick");
+        if (e.key === "Enter") { e.preventDefault(); first?.click(); }
+        if (e.key === "ArrowDown") { e.preventDefault(); first?.focus(); }
+    });
+}
+async function loadLabels(repository) {
+    const k = repository.toLowerCase();
+    if (Array.isArray(labelLists.get(k))) return;
+    labelLists.delete(k);
+    try { labelLists.set(k, (await post("get_labels", { repository })).labels); }
+    catch (error) { labelLists.set(k, { error: error.message }); }
+    refreshLabelList();
+}
+
+function composerHTML(d) {
+    const pr = d.kind === "pr";
+    const noun = pr ? "pull request" : "issue";
+    const toggle = d.state === "merged" ? ""
+        : d.state === "open"
+            ? `<button class="btn" type="button" id="state-toggle" data-to="closed">${icon(pr ? "git-pull-request-closed" : "issue-closed", "c-close")}<span>Close ${noun}</span></button>`
+            : `<button class="btn" type="button" id="state-toggle" data-to="open">${icon(pr ? "git-pull-request" : "issue-reopened", "c-open")}<span>Reopen ${noun}</span></button>`;
+    return `<form class="composer" id="composer" aria-label="Add a comment">
+      <textarea id="composer-text" rows="4" placeholder="Leave a comment" aria-label="Comment (Markdown supported)"></textarea>
+      <div class="composer-foot">
+        <span class="composer-hint">Markdown supported</span>
+        <span class="composer-actions">${toggle}<button class="btn btn-primary" type="submit" id="composer-send">Comment</button></span>
+      </div>
+    </form>`;
+}
+// Keeps the composer's buttons in step with the draft and any write in flight, without touching the textarea.
+function syncComposer() {
+    const ta = $("composer-text");
+    const d = route.data;
+    if (!ta || !d || d.error) return;
+    const locked = busy.has(route.item);
+    const text = !!ta.value.trim();
+    $("composer-send").disabled = locked || !text;
+    ta.readOnly = locked;
+    const toggle = $("state-toggle");
+    if (toggle) {
+        toggle.disabled = locked;
+        const noun = d.kind === "pr" ? "pull request" : "issue";
+        toggle.querySelector("span").textContent = toggle.dataset.to === "closed"
+            ? (text ? "Close with comment" : `Close ${noun}`)
+            : (text ? "Reopen with comment" : `Reopen ${noun}`);
+    }
+}
+
+function commentHTML(c, first = false, deletable = false) {
+    const who = c.author ? (c.author.agent ? "Copilot" : c.author.login) : "ghost";
+    const del = deletable && c.canDelete && c.id ? `<button class="btn-icon tip c-del" type="button" data-delete-comment="${esc(c.id)}" aria-label="Delete comment">${icon("trash")}</button>` : "";
+    return `<article class="comment${first ? " is-first" : ""}">
+      <header class="comment-head">${avatarHTML({ ...(c.author ?? { login: "ghost" }), name: who }, 20)}<b>${esc(who)}</b>${first ? "opened" : "commented"}<span class="when" title="${esc(new Date(c.createdAt).toLocaleString())}">${ago(c.createdAt)} ago</span>${del}</header>
+      <div class="comment-body markdown-body" data-html-slot></div>
+    </article>`;
+}
+
+function fill(slot, html) {
+    if (!html.trim()) { slot.innerHTML = `<p class="no-desc">No description provided.</p>`; return; }
+    slot.replaceChildren(sanitizeHtml(html, { parseItemUrl }));
+}
+
+function renderDetail() {
+    const restoreFocus = holdFocus();
+    buildDetail();
+    restoreFocus();
+}
+function buildDetail() {
+    if (!route.item) return;
+    const d = route.data;
+    const { repository, number } = splitKey(route.item);
+    const bar = `<div class="dv-bar">
+      <button class="btn btn-invisible" type="button" id="dv-back">${icon("arrow-left")}Back</button>
+      <span class="crumb">${esc(repository)} #${number}</span>
+      <a class="btn" href="${esc(d?.url ?? `https://github.com/${repository}/${"issues"}/${number}`)}" target="_blank" rel="noopener noreferrer">${icon("link-external")}<span>Open on GitHub</span></a>
+    </div>`;
+    if (!d) {
+        detailEl.innerHTML = `${bar}<div class="dv-loading" aria-busy="true"><span class="skeleton"></span><span class="skeleton"></span><span class="skeleton"></span></div>`;
+        return;
+    }
+    if (d.error) {
+        detailEl.innerHTML = `${bar}<div class="dv-error">${icon("alert")} ${esc(d.error)}</div>`;
+        return;
+    }
+    const comments = d.comments.nodes;
+    const hidden = Math.max(0, d.comments.total - comments.length);
+    detailEl.innerHTML = `${bar}
+      <h1 class="dv-title">${esc(d.title)} <span class="num">#${d.number}</span></h1>
+      <div class="dv-sub">${stateBadge(d)}<span><b>${esc(d.author ? (d.author.agent ? "Copilot" : d.author.login) : "ghost")}</b> opened ${ago(d.createdAt)} ago · ${plural(d.comments.total, "comment")}</span></div>
+      <div class="dv-layout">
+        <aside class="dv-side" aria-label="Details" tabindex="-1"></aside>
+        <div class="dv-main">
+          ${commentHTML({ author: d.author, createdAt: d.createdAt }, true)}
+          ${hidden ? `<div class="more-comments">${icon("comment")}<span>${plural(hidden, "earlier comment")} on <a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">GitHub</a></span></div>` : ""}
+          ${comments.map(c => commentHTML(c, false, isTracked(d))).join("")}
+          ${isTracked(d) ? composerHTML(d) : ""}
+        </div>
+      </div>`;
+    const slots = detailEl.querySelectorAll("[data-html-slot]");
+    fill(slots[0], d.bodyHTML);
+    comments.forEach((c, i) => fill(slots[i + 1], c.bodyHTML));
+    const ta = $("composer-text");
+    if (ta) ta.value = drafts.get(route.item) ?? "";
+    renderDetailSide();
+}
+
+// ---- Profile view: a person's contributions over time, plus what is on their plate ----
+function buildPerson(login) {
+    personEl.innerHTML = `
+      <div class="dv-bar">
+        <button class="btn btn-invisible" type="button" id="pv-back">${icon("arrow-left")}Back</button>
+        <span class="crumb">Profile</span>
+        <a class="btn" href="${esc(githubProfile(login))}" target="_blank" rel="noopener noreferrer">${icon("link-external")}<span>Open on GitHub</span></a>
+      </div>
+      <header class="pv-head" id="pv-head"></header>
+      <div class="pv-grid">
+        <section class="box" id="pv-momentum"></section>
+        <section class="box" aria-labelledby="pv-assigned-h">
+          <div class="box-head"><h2 id="pv-assigned-h">Assigned <span class="Counter" id="pv-count"></span></h2></div>
+          <div class="pv-items" id="pv-items"></div>
+        </section>
+      </div>`;
+    personMomentum = createMomentumPanel({ host: $("pv-momentum"), post, context: momentumContext, person: login });
+    paintPerson();
+    syncMomentum();
+}
+
+function paintPerson() {
+    const login = route.person;
+    const head = $("pv-head");
+    if (!login || !head) return;
+    if (!S) {
+        head.innerHTML = `<span class="skeleton round"></span><div class="pv-id"><span class="skeleton"></span></div>`;
+        $("pv-items").innerHTML = skeletonRows(2);
+        return;
+    }
+    const entry = byLogin.get(login);
+    const profile = entry ?? directory.get(login) ?? { login, name: login, agent: login === AGENT };
+    const agent = !!profile.agent;
+    const name = agent ? "Copilot" : profile.name || login;
+    const n = entry?.items.length ?? 0;
+    const t = entry && tone(n, { agent, limit: limit() });
+    head.innerHTML = `${avatarHTML({ ...profile, name }, 56)}
+      <div class="pv-id">
+        <h1 class="pv-name">${esc(name)}</h1>
+        <p class="pv-handle">${agent ? "GitHub Copilot coding agent" : `@${esc(login)}`}</p>
+      </div>
+      ${entry
+        ? `<div class="pv-load"><span class="state tone-${t.key}">${esc(t.label)}</span>${meterHTML(entry, scale())}<span class="pv-open"><b>${n}</b> open</span></div>`
+        : `<span class="pv-untracked">${S?.tracking.hidden.includes(canonLogin(login)) ? "Hidden" : "Not in the tracked team"}</span>`}`;
+    $("pv-count").textContent = entry ? n : "";
+    const hiddenHere = !!S?.tracking.hidden.includes(canonLogin(login));
+    $("pv-items").innerHTML = entry ? itemsHTML(entry) : `<div class="empty-note">${hiddenHere ? "Hidden from the roster, so open work isn’t counted. Show them from the tracking menu to see it here." : "Not assignable in the tracked repositories, so open work isn’t counted."}</div>`;
+    paintLabels($("pv-items"));
+}
+
+// ---- Momentum (the home card and each profile are separate panels over the same server call) ----
+const momentumContext = () => ({
+    settled: !!S && !S.refreshing,
+    people: S ? S.tracking.people.map(login => ({ login, name: whoLabel(login) })) : [],
+    repos: S ? S.tracking.repos : [],
+});
+// Panels wait for a settled state, and the server caches history, so this is cheap to call after every change.
+function syncMomentum() {
+    if (!S || S.refreshing) return;
+    if (!homeEl.hidden) homeMomentum?.sync();
+    personMomentum?.sync();
+}
+
+// ---- Switching views ----
+function leaveView() {
+    route.token++;
+    route.data = null;
+    if (route.item) { detailEl.hidden = true; detailEl.innerHTML = ""; }
+    if (route.person) {
+        personMomentum?.destroy();
+        personMomentum = null;
+        personEl.hidden = true;
+        personEl.innerHTML = "";
+    }
+}
+function enterHome(was) {
+    homeEl.hidden = false;
+    if (S) renderTriage();
+    scrollTo(0, homeScroll);
+    syncMomentum();
+    // Hand keyboard focus back to whatever opened the view we just left.
+    const id = was.slice(was.indexOf(":") + 1);
+    const selector = was.startsWith("item:") ? `a[data-item="${CSS.escape(id)}"]` : was.startsWith("person:") ? `a.person-open[data-person="${CSS.escape(id)}"]` : "";
+    if (selector) [...document.querySelectorAll(selector)].find(el => el.getClientRects().length)?.focus({ preventScroll: true });
+}
+function enterItem() {
+    homeEl.hidden = true;
+    detailEl.hidden = false;
+    renderDetail();
+    scrollTo(0, 0);
+    $("dv-back")?.focus();
+    fetchItem();
+}
+function enterPerson() {
+    homeEl.hidden = true;
+    personEl.hidden = false;
+    buildPerson(route.person);
+    scrollTo(0, 0);
+    $("pv-back")?.focus();
+}
+
+async function fetchItem() {
+    const key = route.item;
+    const token = ++route.token;
+    try {
+        const data = await post("get_item", splitKey(key));
+        if (token !== route.token) return;
+        route.data = data;
+    } catch (error) {
+        if (token !== route.token) return;
+        route.data = route.data && !route.data.error ? route.data : { error: error.message };
+    }
+    renderDetail();
+}
+// After a write, swap in GitHub's copy of the open issue.
+const refreshItem = key => { if (route.item === key) fetchItem(); };
+
+// Idempotent: popstate and hashchange both call it for one navigation.
+function showRoute() {
+    const target = parseHash();
+    const was = viewOf(route);
+    if (viewOf(target) === was) return;
+    endMove();
+    if (was === "home") homeScroll = scrollY;
+    closeScope();
+    leaveView();
+    openPicker = null;
+    route.item = target.item ?? null;
+    route.person = target.person ?? null;
+    if (route.item) enterItem();
+    else if (route.person) enterPerson();
+    else enterHome(was);
+}
+
+// ---- Events ----
+const plainClick = event => event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+document.addEventListener("click", event => {
+    const link = event.target.closest("a[data-item], a[data-person]");
+    if (link && plainClick(event)) {
+        event.preventDefault();
+        if (openPicker && !inDetail(openPicker)) openPicker = null;
+        if (link.dataset.item) openDetail(link.dataset.item); else openPerson(link.dataset.person);
+        return;
+    }
+    if (openPicker && !event.target.closest(".picker") && !event.target.closest("[data-open-picker]")) {
+        openPicker = null;
+        if (route.item) renderDetailSide(); else renderTriage();
+    }
+    const t = event.target.closest("button");
+    if (t?.dataset.bulk === "start") return startSessions();
+    if (t?.dataset.bulk === "clear") { setSelected([...selected], false); return $("triage-all").hidden ? null : $("triage-all").focus(); }
+    if (!t || t.disabled) return;
+    if (t.id === "undo") {
+        const fn = undoAction;
+        if (!fn) return;
+        // The toast rewrites itself when the undo lands, so park focus in the sidebar where holdFocus() can carry it.
+        if (route.item) document.querySelector(".dv-side [data-open-picker]")?.focus();
+        fn();
+        return;
+    }
+    if (t.id === "dv-back" || t.id === "pv-back") return goBack();
+    if (movingIssue?.keyboard && t.classList.contains("person-toggle")) {
+        const person = moveDestination(t);
+        const move = endMove();
+        if (person) reassignIssue(move.key, move.from, person.dataset.login);
+        return;
+    }
+    if (t.id === "theme-toggle") {
+        root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+        root.setAttribute("data-theme-locked", "");
+        applyTheme();
+        paintLabels(document);
+        return;
+    }
+    if (t.id === "refresh") { lastError = null; return load("refresh", { force: true }); }
+    if (t.id === "scope-btn") return scope.open ? closeScope() : openScope();
+    if (t.id === "scope-close") return closeScope();
+    if (t.dataset.openScope) return openScope(t.dataset.openScope);
+    if (t.dataset.tab) { scope.tab = t.dataset.tab; scope.q = ""; $("scope-q").value = ""; $("scope-status").textContent = ""; snapshotOrder(); renderScope(); return; }
+    if (t.dataset.toggle) return toggleTracked(t.dataset.toggle);
+    if (t.dataset.add) return addTracked(t.dataset.add);
+    if (t.classList.contains("person-toggle")) {
+        const login = t.closest(".person").dataset.login;
+        if (openRows.has(login)) openRows.delete(login); else openRows.add(login);
+        renderRoster();
+        fitNow();
+        document.querySelector(`.person[data-login="${CSS.escape(login)}"] .person-toggle`)?.focus({ focusVisible: event.detail === 0 });
+        return;
+    }
+    if (t.dataset.openPicker) {
+        const next = t.dataset.openPicker;
+        openPicker = openPicker === next ? null : next;
+        pickQ = "";
+        labelQ = "";
+        if (inDetail(next)) renderDetailSide(); else renderTriage();
+        if (openPicker?.startsWith("labels:") && route.data && !route.data.error) loadLabels(route.data.repository);
+        (document.querySelector(".picker .pick-q, .picker .label-q") ?? document.querySelector(`[data-open-picker="${CSS.escape(next)}"]`))?.focus();
+        return;
+    }
+    if (t.dataset.label) return toggleLabel(t.dataset.key, t.dataset.label);
+    if (t.id === "state-toggle") return postComment({ thenState: t.dataset.to });
+    if (t.dataset.deleteComment) {
+        // Two-step delete: the first click arms the button, the second deletes.
+        if (t.classList.contains("is-armed")) return removeComment(route.item, Number(t.dataset.deleteComment));
+        t.classList.add("is-armed");
+        t.innerHTML = `${icon("trash")}<span>Delete?</span>`;
+        t.setAttribute("aria-label", "Confirm delete comment");
+        setTimeout(() => { if (t.isConnected) { t.classList.remove("is-armed"); t.innerHTML = icon("trash"); t.setAttribute("aria-label", "Delete comment"); } }, 4000);
+        return;
+    }
+    if (t.dataset.unassign) return removeAssignee(t.dataset.key, t.dataset.unassign);
+    if (t.dataset.assign) return assign(t.dataset.key, t.dataset.assign);
+    if (t.dataset.session) return assign(t.dataset.session, S?.me, { session: true });
+});
+document.addEventListener("change", event => {
+    const box = event.target;
+    if (box.id === "triage-all") {
+        const keys = unowned.map(keyOf);
+        // Any unowned selection means this click clears; otherwise fill up to the batch cap.
+        if (keys.some(k => selected.has(k))) return setSelected(keys, false);
+        return setSelected(keys.slice(0, Math.max(0, MAX_BATCH - selected.size)), true);
+    }
+    if (!box.dataset?.select) return;
+    const key = box.dataset.select;
+    setSelected([key], box.checked);
+    // Re-rendering replaced the checkbox; keep keyboard focus on the same row.
+    document.querySelector(`#home .sel[data-select="${CSS.escape(key)}"]`)?.focus();
+});
+document.addEventListener("submit", event => {
+    if (event.target.id !== "composer") return;
+    event.preventDefault();
+    postComment();
+});
+document.addEventListener("input", event => {
+    if (event.target.id !== "composer-text" || !route.item) return;
+    drafts.set(route.item, event.target.value);
+    syncComposer();
+});
+document.addEventListener("keydown", event => {
+    if (event.target.id === "composer-text" && event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        postComment();
+        return;
+    }
+    const movable = event.target.closest("#roster [data-move-key]");
+    if (event.key === " " && movable) {
+        event.preventDefault();
+        if (!event.repeat) {
+            if (movingIssue) endMove("Move cancelled.");
+            else beginMove(movable, true);
+        }
+        return;
+    }
+    if (event.key !== "Escape") return;
+    if (movingIssue) {
+        event.preventDefault();
+        const move = endMove("Move cancelled.");
+        [...$("roster").querySelectorAll("[data-move-key]")].find(el => el.dataset.moveKey === move.key && el.dataset.moveFrom === move.from)?.focus();
+        return;
+    }
+    if (scope.open) return closeScope();
+    if (selected.size && !openPicker && !route.item && !route.person && !event.target.closest("input, textarea")?.matches(":not(.sel)")) {
+        event.preventDefault();
+        return setSelected([...selected], false);
+    }
+    if (openPicker) {
+        const key = openPicker;
+        openPicker = null;
+        if (inDetail(key)) renderDetailSide(); else renderTriage();
+        document.querySelector(`[data-open-picker="${CSS.escape(key)}"]`)?.focus();
+        return;
+    }
+    if ((route.item || route.person) && !event.target.closest("input, textarea, select")) goBack();
+});
+
+// ---- Boot ----
+document.querySelectorAll("[data-icon]").forEach(b => { b.innerHTML = icon(b.dataset.icon); });
+document.querySelectorAll("[data-icon-inline]").forEach(b => b.replaceWith(document.createRange().createContextualFragment(icon(b.dataset.iconInline))));
+$("roster").innerHTML = skeletonRows(5);
+$("tickets").innerHTML = skeletonRows(3);
+homeMomentum = createMomentumPanel({ host: $("momentum"), post, context: momentumContext });
+showRoute();
+load("refresh", {});

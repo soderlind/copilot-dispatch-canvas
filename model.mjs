@@ -1,0 +1,312 @@
+// Pure, dependency-free logic shared by the extension (Node) and the canvas page (browser).
+
+export class TeamLoadError extends Error {
+    constructor(code, message, retryAt = null) {
+        super(message);
+        this.code = code;
+        this.retryAt = retryAt;
+    }
+}
+
+export const AGENT = "copilot";
+const AGENT_LOGINS = new Set(["copilot", "copilot-swe-agent", "copilot-swe-agent[bot]"]);
+export const loginPattern = /^(?!-)[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?$/i;
+export const repoPattern = /^[a-z\d](?:[a-z\d-]{0,38})\/[\w.-]{1,100}$/i;
+export const MAX_REPOS = 15;
+export const MAX_HIDDEN = 100;
+
+export const canonLogin = login => {
+    if (typeof login !== "string" || !login) return null;
+    const lower = login.toLowerCase();
+    return AGENT_LOGINS.has(lower) ? AGENT : lower;
+};
+export const shortRepo = nwo => String(nwo).split("/")[1] ?? String(nwo);
+export const cleanTitle = title => String(title ?? "")
+    .replace(/^\s*\[?Feature\]?:\s*/i, "")
+    .trim() || String(title ?? "");
+
+export const DEFAULT_LIMIT = 6;
+export const DEFAULT_REFRESH_SECONDS = 300;
+// owner/name where the name contains at least one `*` wildcard, e.g. "soderlind/vmfa*".
+export const repoGlobPattern = /^[a-z\d](?:[a-z\d-]{0,38})\/(?=[\w.*-]*\*)[\w.*-]{1,100}$/i;
+export const isRepoGlob = value => typeof value === "string" && repoGlobPattern.test(value);
+export function globMatcher(glob) {
+    const [owner, name] = glob.split("/");
+    const body = name.split("*").map(part => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\w.-]*");
+    return { owner, test: nwo => new RegExp(`^${owner.replace(/[.-]/g, "\\$&")}/${body}$`, "i").test(nwo) };
+}
+
+const uniq = list => [...new Set(list)];
+const dedupeRepos = list => {
+    const seen = new Map();
+    for (const repo of list) if (!seen.has(repo.toLowerCase())) seen.set(repo.toLowerCase(), repo);
+    return [...seen.values()];
+};
+
+// Tracking is the repositories to watch plus the people to hide. People themselves come from the repositories.
+export function normalizeTracking(value, { maxRepos = MAX_REPOS, maxHidden = MAX_HIDDEN } = {}) {
+    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    if (!value || typeof value !== "object" || Array.isArray(value)) fail("Provide repos and hidden lists.");
+    const extra = Object.keys(value).filter(key => !["repos", "hidden"].includes(key));
+    if (extra.length) fail(`Unknown tracking field: ${extra[0]}.`);
+    if (!Array.isArray(value.repos) || !Array.isArray(value.hidden ?? [])) fail("repos and hidden must be lists.");
+    if (!value.repos.every(r => typeof r === "string" && repoPattern.test(r))) fail("Every repository must look like owner/name.");
+    if (!(value.hidden ?? []).every(p => typeof p === "string" && loginPattern.test(p.replace(/^@/, "")))) fail("Every hidden person must be a valid GitHub login.");
+    const repos = dedupeRepos(value.repos);
+    const hidden = uniq((value.hidden ?? []).map(p => canonLogin(p.replace(/^@/, ""))));
+    if (repos.length > maxRepos) fail(`Track at most ${maxRepos} repositories.`);
+    if (hidden.length > maxHidden) fail(`Hide at most ${maxHidden} people.`);
+    return { repos, hidden };
+}
+
+// Input to set_tracking: either list may be omitted to keep the current one, and repos may contain owner/prefix* wildcards.
+export function validateTrackingInput(value) {
+    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    if (!value || typeof value !== "object" || Array.isArray(value)) fail("Provide repos and/or hidden.");
+    const extra = Object.keys(value).filter(key => !["repos", "hidden"].includes(key));
+    if (extra.length) fail(`Unknown tracking field: ${extra[0]}.`);
+    if (value.repos === undefined && value.hidden === undefined) fail("Provide repos and/or hidden.");
+    if (value.repos !== undefined && (!Array.isArray(value.repos) || !value.repos.every(r => typeof r === "string" && (repoPattern.test(r) || isRepoGlob(r))))) {
+        fail("Every repository must look like owner/name or owner/prefix*.");
+    }
+    if (value.hidden !== undefined && (!Array.isArray(value.hidden) || !value.hidden.every(p => typeof p === "string" && loginPattern.test(p.replace(/^@/, ""))))) {
+        fail("Every hidden person must be a valid GitHub login.");
+    }
+    return { repos: value.repos, hidden: value.hidden };
+}
+
+export function validateItemRef(input, { title = false, login = false, additional = false, from = false } = {}) {
+    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    if (!input || typeof input !== "object" || Array.isArray(input)) fail("Provide an item.");
+    const logins = [...(login ? ["login"] : []), ...(from ? ["from"] : [])];
+    const allowed = ["repository", "number", ...(title ? ["title"] : []), ...logins, ...(additional ? ["additional"] : [])];
+    const extra = Object.keys(input).filter(key => !allowed.includes(key));
+    if (extra.length) fail(`Unknown field: ${extra[0]}.`);
+    if (typeof input.repository !== "string" || !repoPattern.test(input.repository)) fail("repository must look like owner/name.");
+    if (!Number.isInteger(input.number) || input.number < 1) fail("number must be a positive integer.");
+    if (title && input.title !== undefined && (typeof input.title !== "string" || input.title.length > 300)) fail("title must be a short string.");
+    const normalized = {};
+    for (const name of logins) {
+        if (typeof input[name] !== "string" || !loginPattern.test(input[name].replace(/^@/, ""))) fail(`${name} must be a valid GitHub login.`);
+        normalized[name] = canonLogin(input[name].replace(/^@/, ""));
+    }
+    if (from && normalized.from === normalized.login) fail("Choose a different assignee to move the issue to.");
+    if (additional && input.additional !== undefined && typeof input.additional !== "boolean") fail("additional must be true or false.");
+    return { ...input, ...normalized };
+}
+
+// Keyed list patching: returns the indexes whose HTML changed, or null when keys/order differ and the list must be rebuilt.
+// Leaving unchanged rows in place keeps clicks and hover working while background refreshes re-render.
+export function planRowUpdate(prev, next) {
+    if (!Array.isArray(prev) || prev.length !== next.length) return null;
+    const changed = [];
+    for (let i = 0; i < next.length; i++) {
+        if (prev[i].key !== next[i].key) return null;
+        if (prev[i].html !== next[i].html) changed.push(i);
+    }
+    return changed;
+}
+
+// Compact label display for list rows: the first `max` labels, a "+N" count, and the full list for a tooltip.
+export function labelSummary(labels, max = 2) {
+    const all = (Array.isArray(labels) ? labels : []).filter(l => l && String(l.name ?? "").trim());
+    const shown = all.slice(0, Math.max(0, max));
+    return { shown, more: all.length - shown.length, title: all.map(l => String(l.name)).join(", ") };
+}
+
+export const MAX_SESSION_BATCH = 10;
+// A bulk "start sessions" request: 1..MAX_SESSION_BATCH distinct issue refs, each { repository, number, title? }.
+export function validateSessionBatch(input) {
+    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    if (!input || typeof input !== "object" || Array.isArray(input)) fail("Provide items.");
+    const extra = Object.keys(input).filter(key => key !== "items");
+    if (extra.length) fail(`Unknown field: ${extra[0]}.`);
+    if (!Array.isArray(input.items) || !input.items.length) fail("Select at least one issue.");
+    if (input.items.length > MAX_SESSION_BATCH) fail(`Start at most ${MAX_SESSION_BATCH} sessions at once.`);
+    const seen = new Set();
+    return input.items.map(item => validateItemRef(item, { title: true })).filter(item => {
+        const key = `${item.repository.toLowerCase()}#${item.number}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+export const MAX_COMMENT_LENGTH = 65536;
+// Detail-view edits: an item ref plus exactly the fields that edit needs.
+export function validateEdit(input, kind) {
+    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    const fields = { comment: ["body"], delete_comment: ["commentId"], label: ["label", "add"], set_item_state: ["state"] }[kind];
+    if (!fields) fail("Unknown edit.");
+    if (!input || typeof input !== "object" || Array.isArray(input)) fail("Provide an item.");
+    const { repository, number, ...rest } = input;
+    const extra = Object.keys(rest).filter(key => !fields.includes(key));
+    if (extra.length) fail(`Unknown field: ${extra[0]}.`);
+    const ref = validateItemRef({ repository, number });
+    if (kind === "comment") {
+        if (typeof input.body !== "string" || !input.body.trim()) fail("Write a comment first.");
+        if (input.body.length > MAX_COMMENT_LENGTH) fail(`Comments are limited to ${MAX_COMMENT_LENGTH} characters.`);
+        return { ...ref, body: input.body };
+    }
+    if (kind === "delete_comment") {
+        if (!Number.isSafeInteger(input.commentId) || input.commentId < 1) fail("commentId must be a positive integer.");
+        return { ...ref, commentId: input.commentId };
+    }
+    if (kind === "label") {
+        if (typeof input.label !== "string" || !input.label.trim() || input.label.length > 100) fail("label must be a label name.");
+        if (typeof input.add !== "boolean") fail("add must be true or false.");
+        return { ...ref, label: input.label.trim(), add: input.add };
+    }
+    if (!["open", "closed"].includes(input.state)) fail('state must be "open" or "closed".');
+    return { ...ref, state: input.state };
+}
+
+export const MOMENTUM_DAYS = Object.freeze([7, 30, 90]);
+export const MOMENTUM_DEFAULT_DAYS = 7;
+export const MOMENTUM_METRICS = Object.freeze([
+    { key: "commits", label: "Commits" },
+    { key: "prsOpened", label: "PRs opened" },
+    { key: "prsMerged", label: "PRs merged" },
+    { key: "issuesOpened", label: "Issues opened" },
+    { key: "issuesCompleted", label: "Issues completed" },
+]);
+const MOMENTUM_EVENT_METRIC = { commit: "commits", prOpened: "prsOpened", prMerged: "prsMerged", issueOpened: "issuesOpened", issueCompleted: "issuesCompleted" };
+const DAY_MS = 86_400_000;
+const dayKey = time => new Date(time).toISOString().slice(0, 10);
+// Start (UTC midnight, ms) of a window that ends today and spans `days` calendar days.
+export const momentumStart = (days, now = Date.now()) => Math.floor(now / DAY_MS) * DAY_MS - (days - 1) * DAY_MS;
+
+// `person` and `everyone` are separate fields so that a GitHub login can never collide with a scope keyword.
+export function validateMomentumInput(input = {}) {
+    const fail = message => { throw new TeamLoadError("invalid_input", message); };
+    if (!input || typeof input !== "object" || Array.isArray(input)) fail("Provide momentum options.");
+    const extra = Object.keys(input).filter(key => !["days", "person", "everyone", "repository", "force"].includes(key));
+    if (extra.length) fail(`Unknown field: ${extra[0]}.`);
+    const days = input.days ?? MOMENTUM_DEFAULT_DAYS;
+    if (!MOMENTUM_DAYS.includes(days)) fail(`days must be one of ${MOMENTUM_DAYS.join(", ")}.`);
+    if (input.person !== undefined && input.person !== null && (typeof input.person !== "string" || !loginPattern.test(input.person.replace(/^@/, "")))) fail("person must be a valid GitHub login.");
+    if (input.everyone !== undefined && typeof input.everyone !== "boolean") fail("everyone must be true or false.");
+    if (input.person && input.everyone) fail("Choose a person or everyone, not both.");
+    if (input.repository !== undefined && input.repository !== null && (typeof input.repository !== "string" || !repoPattern.test(input.repository))) fail("repository must look like owner/name.");
+    if (input.force !== undefined && typeof input.force !== "boolean") fail("force must be true or false.");
+    return {
+        days,
+        person: input.person ? canonLogin(input.person.replace(/^@/, "")) : null,
+        everyone: input.everyone === true,
+        repository: input.repository ?? null,
+        force: input.force === true,
+    };
+}
+
+// Bucket activity events into UTC days. Events are { type, at, key, actors }, with actors as GitHub logins.
+// Scope: a person (any event they are an actor on), everyone (every event), or the team (any tracked actor).
+export function dailyMomentum(events, { days, person = null, everyone = false, team = [] }, now = Date.now()) {
+    const start = momentumStart(days, now);
+    const series = Array.from({ length: days }, (_, index) => ({ date: dayKey(start + index * DAY_MS), ...Object.fromEntries(MOMENTUM_METRICS.map(metric => [metric.key, 0])) }));
+    const byDate = new Map(series.map(day => [day.date, day]));
+    const totals = Object.fromEntries(MOMENTUM_METRICS.map(metric => [metric.key, 0]));
+    const teamLogins = new Set(team.map(canonLogin));
+    const wanted = person ? canonLogin(person) : null;
+    const seen = new Set();
+    let unattributed = 0;
+    for (const event of events) {
+        const metric = MOMENTUM_EVENT_METRIC[event.type];
+        const time = Date.parse(event.at);
+        if (!metric || !Number.isFinite(time) || time > now) continue;
+        const day = byDate.get(dayKey(time));
+        if (!day) continue;
+        const id = `${event.type}:${event.key}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const actors = (event.actors ?? []).map(canonLogin).filter(Boolean);
+        if (!actors.length) unattributed++;
+        if (wanted ? !actors.includes(wanted) : !everyone && !actors.some(login => teamLogins.has(login))) continue;
+        day[metric]++;
+        totals[metric]++;
+    }
+    return { series, totals, unattributed };
+}
+
+// Build each tracked person's current load from the open items in the tracked repositories.
+export function computeLoad({ items = [], people = [], profiles = {} }) {
+    const roster = people.map(login => {
+        const profile = profiles[login] ?? {};
+        return {
+            login,
+            agent: login === AGENT,
+            name: login === AGENT ? "Copilot" : profile.name || profile.login || login,
+            avatarUrl: login === AGENT ? null : profile.avatarUrl || `https://avatars.githubusercontent.com/${login}?s=64`,
+            items: [],
+        };
+    });
+    const byLogin = new Map(roster.map(person => [person.login, person]));
+    const unowned = [];
+    for (const item of items) {
+        const base = { repository: item.repository, number: item.number, title: cleanTitle(item.title), url: item.url, updatedAt: item.updatedAt, labels: item.labels ?? [] };
+        if (item.kind === "issue") {
+            const owners = uniq((item.assignees ?? []).map(canonLogin).filter(Boolean));
+            if (!owners.length) { unowned.push({ ...base, kind: "issue" }); continue; }
+            for (const login of owners) byLogin.get(login)?.items.push({ ...base, kind: "issue" });
+            continue;
+        }
+        const roles = new Map();
+        for (const login of (item.reviewers ?? []).map(canonLogin)) if (login) roles.set(login, "review");
+        for (const login of [item.author, ...(item.assignees ?? [])].map(canonLogin)) if (login) roles.set(login, "pr");
+        for (const [login, kind] of roles) byLogin.get(login)?.items.push({ ...base, kind, isDraft: !!item.isDraft });
+    }
+    const recent = (a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt));
+    for (const person of roster) person.items.sort(recent);
+    unowned.sort(recent);
+    return { people: roster, unowned };
+}
+
+// Open-item count for any login (tracked or not), for the pickers.
+export function loadOf(items, login) {
+    const target = canonLogin(login);
+    let count = 0;
+    for (const item of items) {
+        const who = new Set([...(item.assignees ?? []), ...(item.kind === "pr" ? [item.author, ...(item.reviewers ?? [])] : [])].map(canonLogin));
+        if (who.has(target)) count++;
+    }
+    return count;
+}
+
+export function tone(count, { agent = false, limit = 6 } = {}) {
+    if (agent) return { key: "agent", label: count ? `Agent · ${count} running` : "Agent · idle" };
+    if (count === 0) return { key: "free", label: "Free" };
+    if (count <= Math.floor(limit / 2)) return { key: "room", label: "Has room" };
+    if (count <= limit) return { key: "busy", label: count === limit ? "At limit" : "Busy" };
+    return { key: "over", label: `${count - limit} over limit` };
+}
+
+export const meterScale = (counts, limit = 6) => Math.min(16, Math.max(limit + 4, ...counts));
+
+export function sortRoster(people) {
+    const humans = people.filter(p => !p.agent).sort((a, b) => b.items.length - a.items.length || a.name.localeCompare(b.name));
+    return [...humans, ...people.filter(p => p.agent)];
+}
+
+export function sortForAssign(people) {
+    const humans = people.filter(p => !p.agent).sort((a, b) => a.items.length - b.items.length || a.name.localeCompare(b.name));
+    return { humans, agent: people.find(p => p.agent) ?? null };
+}
+
+export function ago(iso, now = Date.now()) {
+    const hours = Math.max(0, (now - new Date(iso).getTime()) / 36e5);
+    if (!Number.isFinite(hours)) return "";
+    if (hours < 1) return "now";
+    if (hours < 24) return `${Math.round(hours)}h`;
+    if (hours < 24 * 60) return `${Math.round(hours / 24)}d`;
+    return `${Math.round(hours / 24 / 30)}mo`;
+}
+
+// Parse a github.com issue/PR URL into an in-canvas reference.
+export function parseItemUrl(href) {
+    let url;
+    try { url = new URL(href, "https://github.com"); } catch { return null; }
+    if (url.hostname !== "github.com") return null;
+    const match = url.pathname.match(/^\/([\w.-]+)\/([\w.-]+)\/(?:issues|pull)\/(\d+)\/?$/);
+    if (!match) return null;
+    const repository = `${match[1]}/${match[2]}`;
+    return repoPattern.test(repository) ? { repository, number: Number(match[3]) } : null;
+}

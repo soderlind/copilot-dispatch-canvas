@@ -1,0 +1,1502 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, writeFile, rm, mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runInNewContext } from "node:vm";
+import {
+    AGENT, TeamLoadError, canonLogin, cleanTitle, computeLoad, loadOf, tone, meterScale, sortRoster, sortForAssign,
+    ago, shortRepo, parseItemUrl, loginPattern, repoPattern, planRowUpdate, normalizeTracking, validateTrackingInput, isRepoGlob, globMatcher, validateItemRef, validateEdit, validateSessionBatch, MAX_SESSION_BATCH,
+    MOMENTUM_DAYS, MOMENTUM_METRICS, dailyMomentum, momentumStart, validateMomentumInput, labelSummary } from "../model.mjs";
+import { createTrackingStore } from "../state.mjs";
+import { createGitHub, normalizeIssue, normalizePull } from "../github.mjs";
+import { createHub } from "../hub.mjs";
+import { detectProjectRepos, selectedRepos, addedRepo } from "../project.mjs";
+import { startServer, perform, statusFor, CSP } from "../server.mjs";
+import { renderHtml } from "../renderer.mjs";
+
+const T = Date.parse("2026-10-20T12:00:00Z");
+const iso = hoursAgo => new Date(T - hoursAgo * 3600_000).toISOString();
+const page = (nodes, next = null) => ({ nodes, pageInfo: { hasNextPage: !!next, endCursor: next } });
+
+// ---------- model ----------
+
+test("canonLogin folds Copilot identities and lowercases", () => {
+    assert.equal(canonLogin("Copilot"), AGENT);
+    assert.equal(canonLogin("copilot-swe-agent"), AGENT);
+    assert.equal(canonLogin("copilot-swe-agent[bot]"), AGENT);
+    assert.equal(canonLogin("BurkeHolland"), "burkeholland");
+    assert.equal(canonLogin(""), null);
+    assert.equal(canonLogin(undefined), null);
+});
+
+test("cleanTitle strips the feature prefix and nothing project-specific", () => {
+    assert.equal(cleanTitle("[Feature]: Add thing"), "Add thing");
+    assert.equal(cleanTitle("Feature: Count down"), "Count down");
+    assert.equal(cleanTitle("[2.0 Launch] Ship it"), "[2.0 Launch] Ship it");
+});
+
+test("computeLoad assigns issues, PRs, reviews and collects unowned issues", () => {
+    const items = [
+        { kind: "issue", repository: "o/a", number: 1, title: "Owned", url: "u1", updatedAt: iso(5), labels: [], assignees: ["burkeholland", "jamesmontemagno"] },
+        { kind: "issue", repository: "o/a", number: 2, title: "Free", url: "u2", updatedAt: iso(1), labels: [{ name: "bug", color: "d73a4a" }], assignees: [] },
+        { kind: "issue", repository: "o/a", number: 3, title: "Copilot's", url: "u3", updatedAt: iso(2), labels: [], assignees: ["copilot"] },
+        { kind: "issue", repository: "o/a", number: 4, title: "Outsider", url: "u4", updatedAt: iso(2), labels: [], assignees: ["someone"] },
+        { kind: "pr", repository: "o/a", number: 10, title: "PR", url: "u10", updatedAt: iso(3), labels: [], assignees: [], author: "burkeholland", reviewers: ["jamesmontemagno", "burkeholland"], isDraft: true },
+        { kind: "pr", repository: "o/a", number: 11, title: "Agent PR", url: "u11", updatedAt: iso(4), labels: [], assignees: ["burkeholland"], author: "copilot", reviewers: [] },
+    ];
+    const { people, unowned } = computeLoad({ items, people: ["burkeholland", "jamesmontemagno", AGENT], profiles: { burkeholland: { name: "Burke Holland", avatarUrl: "https://a/1" } } });
+    const by = Object.fromEntries(people.map(p => [p.login, p]));
+    assert.deepEqual(by.burkeholland.items.map(i => `${i.kind}${i.number}`), ["pr10", "pr11", "issue1"]);
+    assert.equal(by.burkeholland.name, "Burke Holland");
+    assert.equal(by.burkeholland.items.find(i => i.number === 10).isDraft, true, "PR author wins over review request");
+    assert.deepEqual(by.jamesmontemagno.items.map(i => `${i.kind}${i.number}`), ["review10", "issue1"]);
+    assert.deepEqual(by.copilot.items.map(i => `${i.kind}${i.number}`), ["issue3", "pr11"]);
+    assert.equal(by.copilot.agent, true);
+    assert.equal(by.copilot.avatarUrl, null);
+    assert.deepEqual(unowned.map(i => i.number), [2]);
+    assert.equal(loadOf(items, "jamesmontemagno"), 2);
+    assert.equal(loadOf(items, "someone"), 1);
+});
+
+test("tone, scale and sorting", () => {
+    assert.equal(tone(0).key, "free");
+    assert.equal(tone(3).key, "room");
+    assert.equal(tone(4).key, "busy");
+    assert.equal(tone(6).label, "At limit");
+    assert.deepEqual(tone(10), { key: "over", label: "4 over limit" });
+    assert.equal(tone(2, { agent: true }).label, "Agent · 2 running");
+    assert.equal(meterScale([1, 2]), 10);
+    assert.equal(meterScale([12]), 12);
+    assert.equal(meterScale([40]), 16);
+    const people = [
+        { login: "a", name: "Ann", agent: false, items: [1] },
+        { login: AGENT, name: "Copilot", agent: true, items: [1, 2, 3, 4, 5, 6, 7, 8] },
+        { login: "b", name: "Bob", agent: false, items: [1, 2, 3] },
+        { login: "c", name: "Cy", agent: false, items: [] },
+    ];
+    assert.deepEqual(sortRoster(people).map(p => p.login), ["b", "a", "c", AGENT]);
+    const { humans, agent } = sortForAssign(people);
+    assert.deepEqual(humans.map(p => p.login), ["c", "a", "b"]);
+    assert.equal(agent.login, AGENT);
+});
+
+test("ago formats relative times", () => {
+    assert.equal(ago(iso(0.2), T), "now");
+    assert.equal(ago(iso(5), T), "5h");
+    assert.equal(ago(iso(72), T), "3d");
+    assert.equal(ago("nope", T), "");
+});
+
+test("parseItemUrl only accepts github.com issue and PR URLs", () => {
+    assert.deepEqual(parseItemUrl("https://github.com/jamesmontemagno/tiny-clips/issues/424"), { repository: "jamesmontemagno/tiny-clips", number: 424 });
+    assert.deepEqual(parseItemUrl("https://github.com/o/r/pull/7#discussion"), { repository: "o/r", number: 7 });
+    assert.equal(parseItemUrl("https://evil.com/o/r/issues/1"), null);
+    assert.equal(parseItemUrl("https://github.com/o/r/blob/main/x"), null);
+    assert.equal(parseItemUrl("javascript:alert(1)"), null);
+});
+
+test("normalizeTracking and validateItemRef validate input", () => {
+    assert.deepEqual(normalizeTracking({ hidden: ["@BurkeHolland", "burkeholland", "Copilot"], repos: ["o/r", "O/R"] }), { hidden: ["burkeholland", AGENT], repos: ["o/r"] });
+    assert.deepEqual(normalizeTracking({ repos: [] }), { hidden: [], repos: [] }, "hidden is optional");
+    assert.throws(() => normalizeTracking({ hidden: ["bad login!"], repos: [] }), TeamLoadError);
+    assert.throws(() => normalizeTracking({ repos: ["not-a-repo"] }), TeamLoadError);
+    assert.throws(() => normalizeTracking({ repos: ["o/r*"] }), TeamLoadError, "wildcards are expanded before they are stored");
+    assert.throws(() => normalizeTracking({ people: [], repos: [] }), TeamLoadError, "people are derived, not tracked");
+    assert.throws(() => normalizeTracking({ repos: Array.from({ length: 16 }, (_, i) => `o/r${i}`) }), TeamLoadError);
+    assert.deepEqual(validateItemRef({ repository: "o/r", number: 3, login: "@Copilot" }, { login: true }), { repository: "o/r", number: 3, login: AGENT });
+    assert.throws(() => validateItemRef({ repository: "o/r", number: 0 }), TeamLoadError);
+    assert.throws(() => validateItemRef({ repository: "o/r", number: 1, extra: true }), TeamLoadError);
+    assert.throws(() => validateItemRef({ repository: "o/r", number: 1, login: "a b" }, { login: true }), TeamLoadError);
+});
+
+test("set_tracking input takes repos and/or hidden, with owner/prefix* wildcards", () => {
+    assert.deepEqual(validateTrackingInput({ repos: ["o/r", "o/web-*"] }), { repos: ["o/r", "o/web-*"], hidden: undefined });
+    assert.deepEqual(validateTrackingInput({ hidden: ["@Burke"] }), { repos: undefined, hidden: ["@Burke"] });
+    for (const bad of [{}, null, [], { people: ["a"] }, { repos: "o/r" }, { repos: ["*/r"] }, { repos: ["o"] }, { hidden: ["a b"] }]) {
+        assert.throws(() => validateTrackingInput(bad), error => error.code === "invalid_input");
+    }
+});
+
+test("repo wildcards match names within one owner, case-insensitively", () => {
+    assert.equal(isRepoGlob("octo/web-*"), true);
+    assert.equal(isRepoGlob("octo/*-api"), true);
+    assert.equal(isRepoGlob("octo/web"), false);
+    assert.equal(isRepoGlob("*/web"), false);
+    const web = globMatcher("Octo/web-*");
+    assert.equal(web.owner, "Octo");
+    assert.ok(web.test("octo/web-app") && web.test("OCTO/Web-"));
+    assert.ok(!web.test("octo/webapp") && !web.test("other/web-app") && !web.test("octo/x-web-app"));
+    const middle = globMatcher("o/*-ai-*");
+    assert.ok(middle.test("o/vmfa-ai-ability") && !middle.test("o/vmfa-search"));
+    assert.ok(!globMatcher("o/a.b*").test("o/axb"), "a dot is literal, not any character");
+});
+
+test("validateItemRef accepts additional only where it is allowed", () => {
+    const ref = { repository: "o/r", number: 3, login: "@Burke", additional: true };
+    assert.deepEqual(validateItemRef(ref, { login: true, additional: true }), { repository: "o/r", number: 3, login: "burke", additional: true });
+    assert.throws(() => validateItemRef(ref, { login: true }), error => error.code === "invalid_input", "unassign must not accept additional");
+    assert.throws(() => validateItemRef({ ...ref, additional: "yes" }, { login: true, additional: true }), error => error.code === "invalid_input");
+});
+
+test("reassignment validates and canonicalizes both assignees", () => {
+    const ref = { repository: "o/r", number: 5, from: "@Burke", login: "@Copilot" };
+    assert.deepEqual(validateItemRef(ref, { login: true, from: true }), { ...ref, from: "burke", login: AGENT });
+    for (const bad of [{ ...ref, from: "" }, { ...ref, from: "a b" }, { ...ref, from: undefined }, { ...ref, from: "@copilot" }, { ...ref, additional: true }]) {
+        assert.throws(() => validateItemRef(bad, { login: true, from: true }), error => error.code === "invalid_input");
+    }
+    assert.throws(() => validateItemRef(ref, { login: true }), error => error.code === "invalid_input");
+});
+
+test("validateMomentumInput applies defaults and rejects bad input", () => {
+    assert.deepEqual(validateMomentumInput({}), { days: 7, person: null, everyone: false, repository: null, force: false });
+    assert.deepEqual(validateMomentumInput({ days: 7, person: "@Copilot", repository: "o/r", force: true }), { days: 7, person: AGENT, everyone: false, repository: "o/r", force: true });
+    assert.deepEqual(validateMomentumInput({ days: 90, everyone: true }).everyone, true);
+    assert.deepEqual([...MOMENTUM_DAYS], [7, 30, 90]);
+    for (const bad of [{ days: 8 }, { days: "7" }, { person: "a b" }, { person: "x", everyone: true }, { everyone: "yes" }, { repository: "nope" }, { force: 1 }, { extra: 1 }, []]) {
+        assert.throws(() => validateMomentumInput(bad), error => error.code === "invalid_input", JSON.stringify(bad));
+    }
+});
+
+test("dailyMomentum buckets UTC days, de-dupes, and scopes by person, team and everyone", () => {
+    const now = Date.parse("2026-11-10T15:00:00Z");
+    const at = (day, time = "10:00:00") => `2026-11-${day}T${time}Z`;
+    const events = [
+        { type: "commit", at: at("10", "00:00:00"), key: "a", actors: ["BurkeHolland"] },
+        { type: "commit", at: at("10", "00:00:00"), key: "a", actors: ["burkeholland"] },
+        { type: "commit", at: at("09", "23:59:59"), key: "b", actors: ["stranger"] },
+        { type: "commit", at: at("04", "00:00:00"), key: "edge", actors: ["burkeholland"] },
+        { type: "commit", at: at("03", "23:59:59"), key: "before", actors: ["burkeholland"] },
+        { type: "prOpened", at: at("05"), key: "o/r#1", actors: ["Copilot"] },
+        { type: "prMerged", at: at("11"), key: "o/r#1", actors: ["copilot"] },
+        { type: "issueCompleted", at: at("06"), key: "o/r#2", actors: ["burkeholland", "copilot"] },
+        { type: "issueOpened", at: at("07"), key: "o/r#3", actors: [] },
+        { type: "mystery", at: at("07"), key: "x", actors: ["burkeholland"] },
+        { type: "commit", at: "not a date", key: "bad", actors: ["burkeholland"] },
+    ];
+    const team = ["burkeholland", AGENT];
+    const weekly = dailyMomentum(events, { days: 7, team }, now);
+    assert.equal(weekly.series.length, 7);
+    assert.equal(weekly.series[0].date, "2026-11-04");
+    assert.equal(weekly.series.at(-1).date, "2026-11-10");
+    assert.deepEqual(weekly.totals, { commits: 2, prsOpened: 1, prsMerged: 0, issuesOpened: 0, issuesCompleted: 1 });
+    assert.equal(weekly.series[0].commits, 1, "the first instant of the first UTC day is inside the window");
+    assert.equal(weekly.series.at(-1).commits, 1, "duplicates are counted once");
+    assert.equal(weekly.unattributed, 1);
+    assert.equal(MOMENTUM_METRICS.length, 5);
+    for (const metric of MOMENTUM_METRICS) assert.equal(weekly.series.reduce((sum, day) => sum + day[metric.key], 0), weekly.totals[metric.key]);
+    assert.deepEqual(dailyMomentum(events, { days: 7, everyone: true, team }, now).totals, { commits: 3, prsOpened: 1, prsMerged: 0, issuesOpened: 1, issuesCompleted: 1 });
+    assert.deepEqual(dailyMomentum(events, { days: 7, person: AGENT, team }, now).totals, { commits: 0, prsOpened: 1, prsMerged: 0, issuesOpened: 0, issuesCompleted: 1 });
+    assert.equal(dailyMomentum(events, { days: 30, person: "burkeholland", team }, now).totals.commits, 3, "a longer window reaches the earlier commit");
+    assert.equal(momentumStart(7, now), Date.parse("2026-11-04T00:00:00Z"));
+    assert.deepEqual(dailyMomentum([], { days: 7 }, now).totals, { commits: 0, prsOpened: 0, prsMerged: 0, issuesOpened: 0, issuesCompleted: 0 });
+});
+
+// ---------- github ----------
+
+function fakeGh(handlers = {}) {
+    const calls = [];
+    const run = async (args, options) => {
+        calls.push(args);
+        const query = args.find(a => typeof a === "string" && a.startsWith("query="))?.slice(6) ?? "";
+        const vars = Object.fromEntries(args.filter((a, i) => (args[i - 1] === "-f" || args[i - 1] === "-F") && !a.startsWith("query=")).map(a => a.split("=")));
+        for (const [match, handler] of Object.entries(handlers)) {
+            if (args.join(" ").includes(match) || query.includes(match)) return handler({ args, vars, options, calls });
+        }
+        throw new Error(`unexpected gh call: ${args.join(" ").slice(0, 120)}`);
+    };
+    return { run, calls };
+}
+
+const issueNode = (number, assignees = [], extra = {}) => ({ number, title: `Issue ${number}`, url: `https://github.com/o/r/issues/${number}`, updatedAt: iso(number), labels: { nodes: [{ name: "bug", color: "zzz" }] }, assignees: { nodes: assignees.map(login => ({ login })) }, ...extra });
+const prNode = (number, extra = {}) => ({ number, title: `PR ${number}`, url: `https://github.com/o/r/pull/${number}`, updatedAt: iso(number), isDraft: false, author: { login: "copilot-swe-agent" }, labels: { nodes: [] }, assignees: { nodes: [] }, reviewRequests: { nodes: [{ requestedReviewer: { login: "JamesMontemagno" } }, { requestedReviewer: null }] }, ...extra });
+
+test("normalizers canonicalize people and sanitize label colors", () => {
+    const issue = normalizeIssue(issueNode(1, ["Copilot", "Burke"]), "o/r");
+    assert.deepEqual(issue.assignees, [AGENT, "burke"]);
+    assert.equal(issue.labels[0].color, "8c959f");
+    const pr = normalizePull(prNode(2), "o/r");
+    assert.equal(pr.author, AGENT);
+    assert.deepEqual(pr.reviewers, ["jamesmontemagno"]);
+});
+
+test("fetchRepo paginates issues and PRs", async () => {
+    const { run, calls } = fakeGh({
+        "issues(states:OPEN": ({ vars }) => ({ data: { repository: { issues: vars.after ? page([issueNode(2)]) : page([issueNode(1)], "c1") } } }),
+        "pullRequests(states:OPEN": () => ({ data: { repository: { pullRequests: page([prNode(3)]) } } }),
+    });
+    const items = await createGitHub({ run }).fetchRepo("o/r");
+    assert.deepEqual(items.map(i => `${i.kind}${i.number}`), ["issue1", "issue2", "pr3"]);
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every(args => args.includes("--hostname") && args.includes("github.com")));
+});
+
+test("fetchRepo reports coverage limits instead of silently truncating", async () => {
+    const { run } = fakeGh({
+        "issues(states:OPEN": () => ({ data: { repository: { issues: page([issueNode(1)], "more") } } }),
+        "pullRequests(states:OPEN": () => ({ data: { repository: { pullRequests: page([]) } } }),
+    });
+    await assert.rejects(createGitHub({ run }).fetchRepo("o/r"), error => error.code === "coverage_limit");
+});
+
+test("profile requests are coalesced and cached; orgs are rejected", async () => {
+    let hits = 0;
+    const { run } = fakeGh({
+        "users/burke": async () => { hits++; await new Promise(r => setTimeout(r, 5)); return { login: "Burke", name: "Burke H", avatar_url: "https://a/b", type: "User" }; },
+        "users/acme": () => ({ login: "acme", type: "Organization" }),
+    });
+    const gh = createGitHub({ run });
+    const [a, b] = await Promise.all([gh.profile("burke"), gh.profile("Burke")]);
+    assert.equal(hits, 1);
+    assert.deepEqual(a, b);
+    await gh.profile("burke");
+    assert.equal(hits, 1);
+    assert.equal((await gh.profile("copilot")).agent, true);
+    await assert.rejects(gh.profile("acme"), error => error.code === "not_found");
+});
+
+test("graphql errors surface as TeamLoadErrors", async () => {
+    const { run } = fakeGh({ "nameWithOwner url": () => ({ errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] }) });
+    await assert.rejects(createGitHub({ run }).repoInfo("o/missing"), error => error.code === "not_found");
+});
+
+function issueServer(initial = []) {
+    let assignees = [...initial];
+    let state = "open";
+    let isPr = false;
+    const { run, calls } = fakeGh({
+        "repos/o/r/issues/5": () => ({ state, pull_request: isPr ? {} : undefined, assignees: assignees.map(login => ({ login })) }),
+        "issue edit": ({ args }) => {
+            const login = args[args.length - 1] === "@copilot" ? "Copilot" : args[args.length - 1];
+            if (args.includes("--add-assignee")) assignees.push(login);
+            else assignees = assignees.filter(l => l !== login);
+            return "";
+        },
+    });
+    return { run, calls, set: next => { ({ state = state, isPr = isPr } = next); } };
+}
+
+test("assign uses gh issue edit, maps Copilot to @copilot, and verifies", async () => {
+    const server = issueServer();
+    const gh = createGitHub({ run: server.run });
+    assert.deepEqual(await gh.assign({ repository: "o/r", number: 5, login: AGENT }), { assignees: [AGENT], added: true });
+    const edit = server.calls.find(args => args[0] === "issue");
+    assert.deepEqual(edit, ["issue", "edit", "5", "--repo", "o/r", "--add-assignee", "@copilot"]);
+    assert.deepEqual(await gh.unassign({ repository: "o/r", number: 5, login: AGENT }), { assignees: [] });
+    assert.ok(server.calls.some(args => args.includes("--remove-assignee") && args.includes("@copilot")));
+});
+
+test("assign with additional adds beside existing assignees and is a no-op for an existing one", async () => {
+    const server = issueServer(["jamesmontemagno"]);
+    const gh = createGitHub({ run: server.run });
+    assert.deepEqual(await gh.assign({ repository: "o/r", number: 5, login: AGENT, additional: true }), { assignees: ["jamesmontemagno", AGENT], added: true });
+    const writes = () => server.calls.filter(args => args[0] === "issue").length;
+    assert.equal(writes(), 1);
+    assert.deepEqual(await gh.assign({ repository: "o/r", number: 5, login: "jamesmontemagno", additional: true }), { assignees: ["jamesmontemagno", AGENT], added: false });
+    assert.equal(writes(), 1, "no write when the person is already assigned");
+    await assert.rejects(gh.assign({ repository: "o/r", number: 5, login: "burkeholland" }), error => error.code === "conflict", "the strict triage guard still applies without additional");
+    const closed = issueServer(["jamesmontemagno"]);
+    closed.set({ state: "closed" });
+    await assert.rejects(createGitHub({ run: closed.run }).assign({ repository: "o/r", number: 5, login: AGENT, additional: true }), error => error.code === "conflict");
+    const pr = issueServer(["jamesmontemagno"]);
+    pr.set({ isPr: true });
+    await assert.rejects(createGitHub({ run: pr.run }).assign({ repository: "o/r", number: 5, login: AGENT, additional: true }), error => error.code === "invalid_input");
+});
+
+test("unassign removes only the requested assignee and is idempotent", async () => {
+    const server = issueServer(["jamesmontemagno", "Copilot"]);
+    const gh = createGitHub({ run: server.run });
+    assert.deepEqual(await gh.unassign({ repository: "o/r", number: 5, login: "jamesmontemagno" }), { assignees: [AGENT] });
+    assert.deepEqual(await gh.unassign({ repository: "o/r", number: 5, login: "jamesmontemagno" }), { assignees: [AGENT] });
+    assert.equal(server.calls.filter(args => args.includes("--remove-assignee")).length, 1);
+});
+
+test("reassign verifies the new owner before removing the source and preserves other assignees", async () => {
+    const server = issueServer(["jamesmontemagno", "helper"]);
+    const result = await createGitHub({ run: server.run }).reassign({ repository: "o/r", number: 5, from: "jamesmontemagno", login: AGENT });
+    assert.deepEqual(result, { assignees: ["helper", AGENT], added: true });
+    const writes = server.calls.filter(args => args[0] === "issue");
+    assert.deepEqual(writes.map(args => args.slice(-2)), [["--add-assignee", "@copilot"], ["--remove-assignee", "jamesmontemagno"]]);
+    const addIndex = server.calls.indexOf(writes[0]), removeIndex = server.calls.indexOf(writes[1]);
+    assert.ok(server.calls.slice(addIndex + 1, removeIndex).some(args => args[0] === "api"), "a fresh read verifies the new owner before removal");
+});
+
+test("reassign to an existing co-assignee only removes the source, including Copilot", async () => {
+    const server = issueServer(["Copilot", "burkeholland", "helper"]);
+    const result = await createGitHub({ run: server.run }).reassign({ repository: "o/r", number: 5, from: AGENT, login: "burkeholland" });
+    assert.deepEqual(result, { assignees: ["burkeholland", "helper"], added: false });
+    assert.deepEqual(server.calls.filter(args => args[0] === "issue").map(args => args.slice(-2)), [["--remove-assignee", "@copilot"]]);
+});
+
+test("reassign rejects stale sources, closed issues, PRs and same-person drops without writes", async () => {
+    for (const scenario of [
+        { initial: [], from: "burkeholland", login: AGENT, code: "conflict" },
+        { initial: ["burkeholland"], state: "closed", from: "burkeholland", login: AGENT, code: "conflict" },
+        { initial: ["burkeholland"], isPr: true, from: "burkeholland", login: AGENT, code: "invalid_input" },
+        { initial: ["burkeholland"], from: "burkeholland", login: "burkeholland", code: "invalid_input" },
+    ]) {
+        const server = issueServer(scenario.initial);
+        server.set({ state: scenario.state ?? "open", isPr: scenario.isPr ?? false });
+        await assert.rejects(createGitHub({ run: server.run }).reassign({ repository: "o/r", number: 5, from: scenario.from, login: scenario.login }), error => error.code === scenario.code);
+        assert.equal(server.calls.filter(args => args[0] === "issue").length, 0);
+    }
+});
+
+test("reassign never removes the source when adding the new owner fails or is ignored", async () => {
+    for (const fail of [false, true]) {
+        const server = issueServer(["burkeholland"]);
+        const run = async (args, options) => {
+            if (args.includes("--add-assignee")) {
+                if (fail) throw new TeamLoadError("permission_denied", "Copilot is unavailable.");
+                return "";
+            }
+            return server.run(args, options);
+        };
+        await assert.rejects(createGitHub({ run }).reassign({ repository: "o/r", number: 5, from: "burkeholland", login: AGENT }), TeamLoadError);
+        assert.ok(!server.calls.some(args => args.includes("--remove-assignee")));
+        assert.deepEqual((await createGitHub({ run: server.run }).readIssue({ repository: "o/r", number: 5 })).assignees, ["burkeholland"]);
+    }
+});
+
+test("reassign reports partial writes explicitly when removing the source fails", async () => {
+    const server = issueServer(["burkeholland"]);
+    const run = async (args, options) => {
+        if (args.includes("--remove-assignee")) throw new TeamLoadError("permission_denied", "Removal denied.");
+        return server.run(args, options);
+    };
+    const gh = createGitHub({ run });
+    await assert.rejects(gh.reassign({ repository: "o/r", number: 5, from: "burkeholland", login: AGENT }), error => error.code === "write_uncertain" && /may still be assigned/.test(error.message) && /Removal denied/.test(error.message));
+    assert.deepEqual((await gh.readIssue({ repository: "o/r", number: 5 })).assignees, ["burkeholland", AGENT]);
+});
+
+test("assign refuses conflicts: already assigned, closed, or a PR", async () => {
+    const taken = issueServer(["jamesmontemagno"]);
+    await assert.rejects(createGitHub({ run: taken.run }).assign({ repository: "o/r", number: 5, login: "burkeholland" }), error => error.code === "conflict" && /@jamesmontemagno/.test(error.message));
+    assert.ok(!taken.calls.some(args => args[0] === "issue"), "no write after a conflict");
+    const closed = issueServer();
+    closed.set({ state: "closed" });
+    await assert.rejects(createGitHub({ run: closed.run }).assign({ repository: "o/r", number: 5, login: "burkeholland" }), error => error.code === "conflict");
+    const pr = issueServer();
+    pr.set({ isPr: true });
+    await assert.rejects(createGitHub({ run: pr.run }).assign({ repository: "o/r", number: 5, login: "burkeholland" }), error => error.code === "invalid_input");
+});
+
+test("assign reports when GitHub silently ignores the assignee", async () => {
+    const { run } = fakeGh({
+        "repos/o/r/issues/5": () => ({ state: "open", assignees: [] }),
+        "issue edit": () => "",
+    });
+    await assert.rejects(createGitHub({ run }).assign({ repository: "o/r", number: 5, login: AGENT }), error => error.code === "github_error" && /Copilot/.test(error.message));
+});
+
+test("writes are never retried; reads retry once on transient errors", async () => {
+    let edits = 0, reads = 0;
+    const flaky = fakeGh({
+        "repos/o/r/issues/5": () => ({ state: "open", assignees: [] }),
+        "issue edit": () => { edits++; throw new Error("HTTP 502"); },
+    });
+    await assert.rejects(createGitHub({ run: flaky.run }).assign({ repository: "o/r", number: 5, login: "x" }));
+    assert.equal(edits, 1);
+    const read = fakeGh({ "users/x": () => { reads++; if (reads === 1) throw new Error("HTTP 502"); return { login: "x", type: "User" }; } });
+    assert.equal((await createGitHub({ run: read.run }).profile("x")).login, "x");
+    assert.equal(reads, 2);
+});
+
+const commitNode = (oid, hoursAgo, login = "Burke") => ({ oid, committedDate: iso(hoursAgo), author: { user: login ? { login } : null } });
+const pullHistoryNode = (number, extra = {}) => ({ number, createdAt: iso(300), updatedAt: iso(number), mergedAt: null, author: { login: "Burke" }, ...extra });
+const issueHistoryNode = (number, extra = {}) => ({ number, createdAt: iso(300), updatedAt: iso(number), closedAt: null, state: "OPEN", stateReason: null, author: { login: "Burke" }, assignees: { nodes: [] }, ...extra });
+const commitsPage = (nodes, next = null) => ({ data: { repository: { defaultBranchRef: { target: { history: page(nodes, next) } } } } });
+
+test("history turns commits, PRs and issues into attributed events and pages back only to the window start", async () => {
+    // 7 days ending 2026-10-20 reaches back to 2026-10-14T00:00Z, i.e. 156 hours before T.
+    const since = new Date(momentumStart(7, T)).toISOString();
+    const { run, calls } = fakeGh({
+        "history(first:100": ({ vars }) => commitsPage(vars.after ? [commitNode("c3", 20, "Copilot")] : [commitNode("c1", 1), commitNode("c2", 2, null)], vars.after ? null : "cc1"),
+        "pullRequests(first:100": ({ vars }) => ({ data: { repository: { pullRequests: vars.after
+            ? page([pullHistoryNode(60), pullHistoryNode(400)], "never-requested")
+            : page([pullHistoryNode(3, { mergedAt: iso(2), author: { login: "copilot-swe-agent" } })], "p1") } } }),
+        "issues(first:100": () => ({ data: { repository: { issues: page([
+            issueHistoryNode(7, { state: "CLOSED", stateReason: "COMPLETED", closedAt: iso(5), assignees: { nodes: [{ login: "Burke" }, { login: "copilot-swe-agent" }] } }),
+            issueHistoryNode(8, { state: "CLOSED", stateReason: "NOT_PLANNED", closedAt: iso(6) }),
+            issueHistoryNode(9),
+        ]) } } }),
+    });
+    const result = await createGitHub({ run, now: () => T }).history("o/r", { days: 7 });
+    assert.equal(result.truncated, false);
+    const events = Object.fromEntries(result.events.map(event => [`${event.type}:${event.key}`, event]));
+    assert.deepEqual(events["commit:o/r@c1"].actors, ["burke"]);
+    assert.deepEqual(events["commit:o/r@c2"].actors, [], "a commit without a GitHub account has no actor");
+    assert.deepEqual(events["commit:o/r@c3"].actors, [AGENT]);
+    assert.deepEqual(events["prOpened:o/r#3"].actors, [AGENT]);
+    assert.equal(events["prMerged:o/r#3"].at, iso(2));
+    assert.equal(events["prOpened:o/r#60"].at, iso(300), "a PR updated in the window is kept even if it was opened before it");
+    assert.equal(events["prOpened:o/r#400"], undefined, "a PR last updated before the window is dropped");
+    assert.deepEqual(events["issueCompleted:o/r#7"].actors, ["burke", AGENT], "completion is credited to the assignees");
+    assert.equal(events["issueCompleted:o/r#8"], undefined, "closing as not planned is not completion");
+    assert.equal(events["issueCompleted:o/r#9"], undefined);
+    assert.deepEqual(events["issueOpened:o/r#9"].actors, ["burke"]);
+    assert.equal(calls.filter(args => args.join(" ").includes("pullRequests(first:100")).length, 2, "stops paging once a page runs past the window");
+    assert.ok(calls.filter(args => args.join(" ").includes("history(first:100")).every(args => args.includes(`since=${since}`)), "commits are filtered server-side");
+});
+
+test("history flags truncation instead of silently dropping older activity", async () => {
+    const { run, calls } = fakeGh({
+        "history(first:100": () => commitsPage([commitNode("c", 1)], "more"),
+        "pullRequests(first:100": () => ({ data: { repository: { pullRequests: page([], null) } } }),
+        "issues(first:100": () => ({ data: { repository: { issues: page([], null) } } }),
+    });
+    const result = await createGitHub({ run, now: () => T }).history("o/r", { days: 90 });
+    assert.equal(result.truncated, true);
+    assert.equal(calls.filter(args => args.join(" ").includes("history(first:100")).length, 10, "page cap");
+});
+
+test("history tolerates an empty repository and reports a missing one", async () => {
+    const empty = fakeGh({
+        "history(first:100": () => ({ data: { repository: { defaultBranchRef: null } } }),
+        "pullRequests(first:100": () => ({ data: { repository: { pullRequests: page([]) } } }),
+        "issues(first:100": () => ({ data: { repository: { issues: page([]) } } }),
+    });
+    assert.deepEqual(await createGitHub({ run: empty.run, now: () => T }).history("o/r", { days: 7 }), { events: [], truncated: false });
+    const missing = fakeGh({
+        "history(first:100": () => ({ data: { repository: null } }),
+        "pullRequests(first:100": () => ({ data: { repository: null } }),
+        "issues(first:100": () => ({ data: { repository: null } }),
+    });
+    await assert.rejects(createGitHub({ run: missing.run, now: () => T }).history("o/r", { days: 7 }), error => error.code === "not_found");
+});
+
+test("detail normalizes issues and merged PRs", async () => {
+    const node = {
+        __typename: "PullRequest", number: 9, title: "T", url: "https://github.com/o/r/pull/9", state: "MERGED", merged: true, isDraft: false,
+        createdAt: iso(10), updatedAt: iso(1), bodyHTML: "<p>hi</p>", author: { login: "copilot-swe-agent", avatarUrl: "x" },
+        labels: { nodes: [] }, assignees: { nodes: [{ login: "Burke", name: "B", avatarUrl: "a" }] },
+        comments: { totalCount: 40, nodes: [{ url: "c", createdAt: iso(2), bodyHTML: "<p>c</p>", author: null }] },
+    };
+    const { run } = fakeGh({ issueOrPullRequest: () => ({ data: { repository: { issueOrPullRequest: node } } }) });
+    const d = await createGitHub({ run }).detail({ repository: "o/r", number: 9 });
+    assert.equal(d.kind, "pr");
+    assert.equal(d.state, "merged");
+    assert.equal(d.author.agent, true);
+    assert.equal(d.comments.total, 40);
+    assert.equal(d.comments.nodes[0].author, null);
+});
+
+// ---------- tracking store ----------
+
+test("tracking store defaults, persists atomically, and remembers tracked repos", async () => {
+    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    try {
+        const store = createTrackingStore(home);
+        assert.equal(store.path, join(home, "extensions", "team-load", "artifacts", "tracking.json"));
+        assert.deepEqual(await store.read(), { repos: [], hidden: [], knownRepos: [], limit: 6, refreshSeconds: 300 });
+        await Promise.all([
+            store.write({ repos: ["o/r", "someone/else"], hidden: ["@Newperson"] }),
+            store.write({ repos: ["o/r-mac"], hidden: [] }),
+        ]);
+        const saved = JSON.parse(await readFile(store.path, "utf8"));
+        assert.equal(saved.format, "team-load-tracking");
+        assert.equal(saved.version, 1);
+        assert.deepEqual(saved.repos, ["o/r-mac"]);
+        assert.deepEqual(saved.hidden, []);
+        assert.deepEqual(saved.knownRepos, ["o/r", "someone/else", "o/r-mac"]);
+        assert.equal("people" in saved, false, "people come from the repositories, not the file");
+        await writeFile(store.path, "{ broken");
+        await assert.rejects(store.read(), error => error.code === "storage_error");
+    } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("tracking store keeps hand-edited settings and caps remembered repos", async () => {
+    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    try {
+        const store = createTrackingStore(home);
+        await store.write({ repos: ["o/r"] });
+        const raw = JSON.parse(await readFile(store.path, "utf8"));
+        await writeFile(store.path, JSON.stringify({ ...raw, limit: 4, refreshSeconds: 120 }));
+        for (let i = 0; i < 3; i++) await store.write({ repos: Array.from({ length: 15 }, (_, j) => `o/r${i * 15 + j}`) });
+        const read = await store.read();
+        assert.equal(read.limit, 4);
+        assert.equal(read.refreshSeconds, 120);
+        assert.equal(read.knownRepos.length, 30);
+        await writeFile(store.path, JSON.stringify({ ...raw, limit: 0, refreshSeconds: 5 }));
+        assert.deepEqual([(await store.read()).limit, (await store.read()).refreshSeconds], [6, 300], "out-of-range settings fall back to defaults");
+    } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+// ---------- hub ----------
+
+function hubFixture({ sendPrompt = async () => {}, issues = { "o/r": [issueNode(5)] }, failing = [], events = {}, now = () => T } = {}) {
+    const settings = { knownRepos: [], limit: 6, refreshSeconds: 300 };
+    const store = { data: null, read: async () => store.data ?? { repos: ["o/r"], hidden: [], ...settings }, write: async next => (store.data = { ...normalizeTracking(next), ...settings }) };
+    const team = [
+        { login: "BurkeHolland", name: "Burke Holland", avatarUrl: "b", agent: false },
+        { login: "jamesmontemagno", name: "James", avatarUrl: "j", agent: false },
+        { login: "Helper", name: "Help", avatarUrl: "h", agent: false },
+        { login: AGENT, name: null, avatarUrl: "c", agent: true },
+    ];
+    const writes = [];
+    const historyCalls = [];
+    const assignees = new Map();
+    const github = {
+        fetchRepo: async name => { if (failing.includes(name)) throw new TeamLoadError("permission_denied", "no access"); return (issues[name] ?? []).map(node => normalizeIssue({ ...node, assignees: { nodes: (assignees.get(`${name}#${node.number}`) ?? []).map(login => ({ login })) } }, name)); },
+        history: async (name, { days }) => { historyCalls.push([name, days]); return { events: events[name] ?? [], truncated: false }; },
+        repoInfo: async name => { if (name === "o/missing") throw new TeamLoadError("not_found", "nope"); return { nameWithOwner: name.replace(/^O\//, "o/"), url: `https://github.com/${name}`, open: 1, actors: name === "o/solo" ? [team[2]] : team }; },
+        viewerRepos: async () => [{ nameWithOwner: "o/other", url: "https://github.com/o/other", open: 2 }],
+        ownerRepos: async owner => { if (owner === "ghost") throw new TeamLoadError("not_found", "no owner"); return ["o/web-app", "o/web-api", "o/webby", "o/other", "o/r"]; },
+        profile: async login => { if (login === "ghost404") throw new TeamLoadError("not_found", "no"); return { login, name: login.toUpperCase(), avatarUrl: null }; },
+        me: async () => "burkeholland",
+        detail: async ref => ({ ...ref, title: "x" }),
+        // Mirrors the real layer: without `additional` an owned issue is a conflict; with it, an existing assignee is a no-op.
+        assign: async ({ repository, number, login, additional }) => {
+            const key = `${repository}#${number}`;
+            const current = assignees.get(key) ?? [];
+            if (additional && current.includes(login)) return { assignees: current, added: false };
+            if (!additional && current.length) throw new TeamLoadError("conflict", `${key} is already assigned.`);
+            writes.push(["assign", repository, number, login, ...(additional ? ["additional"] : [])]);
+            assignees.set(key, [...current, login]);
+            return { assignees: [...current, login], added: true };
+        },
+        unassign: async ({ repository, number, login }) => {
+            writes.push(["unassign", repository, number, login]);
+            const key = `${repository}#${number}`;
+            const left = (assignees.get(key) ?? []).filter(value => value !== login);
+            assignees.set(key, left);
+            return { assignees: left };
+        },
+        reassign: async ({ repository, number, from, login }) => {
+            const key = `${repository}#${number}`;
+            if (!(assignees.get(key) ?? []).includes(from)) throw new TeamLoadError("conflict", `${key} is no longer assigned to ${from}.`);
+            const result = await github.assign({ repository, number, login, additional: true });
+            const removed = await github.unassign({ repository, number, login: from });
+            return { ...removed, added: result.added };
+        },
+    };
+    return { hub: createHub({ store, github, sendPrompt, now }), writes, store, github, historyCalls, assignees };
+}
+
+async function settle(hub) {
+    for (let i = 0; i < 20 && hub.state().refreshing; i++) await new Promise(r => setTimeout(r, 1));
+}
+
+test("hub refresh builds state with directory and per-repo status", async () => {
+    const { hub } = hubFixture();
+    await hub.refresh();
+    await settle(hub);
+    const s = hub.state();
+    assert.equal(s.refreshing, false);
+    assert.equal(s.me, "burkeholland");
+    assert.equal(s.repoStatus["o/r"].status, "ready");
+    assert.deepEqual(s.items.map(i => i.number), [5]);
+    assert.deepEqual(s.tracking.people.sort(), ["burkeholland", AGENT, "helper", "jamesmontemagno"].sort(), "the team is the repo's assignable users");
+    assert.ok(s.directory.people.every(p => p.inRepos));
+    assert.equal(s.directory.people.find(p => p.login === "burkeholland").name, "Burke Holland");
+    assert.deepEqual(s.directory.repos.find(r => r.nameWithOwner === "o/other"), { nameWithOwner: "o/other", url: "https://github.com/o/other", open: 2 }, "your recent repos are offered");
+});
+
+test("the team also includes outside assignees, and hidden people drop out of the roster but stay assignable", async () => {
+    const { hub, assignees, store } = hubFixture();
+    assignees.set("o/r#5", ["outsider"]);
+    await hub.refresh(); await settle(hub);
+    assert.ok(hub.state().tracking.people.includes("outsider"));
+    const s = await hub.setTracking({ hidden: ["@Helper", "Copilot"] });
+    await settle(hub);
+    assert.deepEqual(store.data.repos, ["o/r"], "omitting repos keeps them");
+    assert.deepEqual(hub.state().tracking.hidden, ["helper", AGENT]);
+    assert.ok(!hub.state().tracking.people.includes("helper") && !hub.state().tracking.people.includes(AGENT));
+    assert.ok(s.directory.people.some(p => p.login === "helper" && p.inRepos), "hidden people stay in the picker");
+    assignees.set("o/r#5", []);
+    await hub.refresh({ force: true }); await settle(hub);
+    await hub.assign({ repository: "o/r", number: 5, login: "helper" });
+    assert.deepEqual(assignees.get("o/r#5"), ["helper"]);
+});
+
+test("the team follows the tracked repositories", async () => {
+    const { hub } = hubFixture();
+    await hub.setTracking({ repos: ["o/solo"] });
+    await settle(hub);
+    assert.deepEqual(hub.state().tracking.people, ["helper"]);
+    await assert.rejects(hub.assign({ repository: "o/solo", number: 5, login: "jamesmontemagno" }), error => error.code === "invalid_input", "people from untracked repos are not assignable");
+});
+
+test("hub assign/unassign enforce tracking and return fresh state", async () => {
+    const { hub, writes } = hubFixture();
+    await hub.refresh(); await settle(hub);
+    const result = await hub.assign({ repository: "o/r", number: 5, login: "@Copilot" });
+    assert.deepEqual(writes.at(-1), ["assign", "o/r", 5, AGENT]);
+    assert.deepEqual(result.state.items[0].assignees, [AGENT]);
+    await hub.unassign({ repository: "o/r", number: 5, login: AGENT });
+    assert.deepEqual(writes.at(-1), ["unassign", "o/r", 5, AGENT]);
+    await assert.rejects(hub.assign({ repository: "o/untracked", number: 5, login: AGENT }), error => error.code === "invalid_input");
+    await assert.rejects(hub.assign({ repository: "o/r", number: 5, login: "stranger" }), error => error.code === "invalid_input");
+});
+
+test("hub can add and remove assignees on an owned issue, including outside assignees", async () => {
+    const { hub, writes, assignees } = hubFixture();
+    await hub.refresh(); await settle(hub);
+    await hub.assign({ repository: "o/r", number: 5, login: "jamesmontemagno" });
+    await assert.rejects(hub.assign({ repository: "o/r", number: 5, login: AGENT }), error => error.code === "conflict", "a second assignee needs additional");
+    const added = await hub.assign({ repository: "o/r", number: 5, login: AGENT, additional: true });
+    assert.deepEqual(writes.at(-1), ["assign", "o/r", 5, AGENT, "additional"]);
+    assert.equal(added.added, true);
+    assert.deepEqual(added.state.items[0].assignees, ["jamesmontemagno", AGENT]);
+    assert.equal((await hub.assign({ repository: "o/r", number: 5, login: AGENT, additional: true })).added, false, "adding someone already assigned is a no-op");
+    await assert.rejects(hub.assign({ repository: "o/r", number: 5, login: "stranger", additional: true }), error => error.code === "invalid_input", "only known people can be added");
+    assignees.set("o/r#5", ["jamesmontemagno", "stranger"]);
+    const removed = await hub.unassign({ repository: "o/r", number: 5, login: "@Stranger" });
+    assert.deepEqual(writes.at(-1), ["unassign", "o/r", 5, "stranger"], "an outside assignee can always be removed");
+    assert.deepEqual(removed.state.items[0].assignees, ["jamesmontemagno"]);
+    await assert.rejects(hub.unassign({ repository: "o/untracked", number: 5, login: "stranger" }), error => error.code === "invalid_input");
+    await assert.rejects(hub.unassign({ repository: "o/r", number: 5, login: "stranger", additional: true }), error => error.code === "invalid_input");
+});
+
+test("reassign action enforces tracking, canonicalizes logins and returns post-write state", async () => {
+    const { hub, writes, assignees } = hubFixture();
+    assignees.set("o/r#5", ["burkeholland", "outside"]);
+    const result = await perform({ hub }, "reassign", { repository: "O/R", number: 5, from: "@BurkeHolland", login: "@Copilot" });
+    assert.deepEqual(result.assignees, ["outside", AGENT]);
+    assert.deepEqual(result.state.items[0].assignees, ["outside", AGENT]);
+    assert.equal(result.added, true);
+    assert.deepEqual(writes, [["assign", "o/r", 5, AGENT, "additional"], ["unassign", "o/r", 5, "burkeholland"]]);
+    for (const bad of [
+        { repository: "o/untracked", number: 5, from: AGENT, login: "burkeholland" },
+        { repository: "o/r", number: 5, from: AGENT, login: "stranger" },
+        { repository: "o/r", number: 5, from: AGENT, login: AGENT },
+        { repository: "o/r", number: 5, login: "burkeholland" },
+    ]) {
+        await assert.rejects(perform({ hub }, "reassign", bad), error => error.code === "invalid_input");
+    }
+    assert.equal(writes.length, 2);
+});
+
+test("hub refreshes after a failed move so partial writes do not leave stale load counts", async () => {
+    const { hub, github, assignees } = hubFixture();
+    assignees.set("o/r#5", ["burkeholland"]);
+    await hub.refresh(); await settle(hub);
+    github.reassign = async () => {
+        assignees.set("o/r#5", ["burkeholland", AGENT]);
+        throw new TeamLoadError("write_uncertain", "Removal failed.");
+    };
+    await assert.rejects(hub.reassign({ repository: "o/r", number: 5, from: "burkeholland", login: AGENT }), error => error.code === "write_uncertain");
+    assert.deepEqual(hub.state().items[0].assignees, ["burkeholland", AGENT]);
+});
+
+test("start_session assigns me, sends the prompt, and rolls back if sending fails", async () => {
+    const prompts = [];
+    const ok = hubFixture({ sendPrompt: async prompt => prompts.push(prompt) });
+    await ok.hub.refresh(); await settle(ok.hub);
+    await ok.hub.startSession({ repository: "o/r", number: 5, title: "Fix it" });
+    assert.deepEqual(ok.writes, [["assign", "o/r", 5, "burkeholland"]]);
+    assert.match(prompts[0], /o\/r issue #5 title="Fix it"/);
+    const bad = hubFixture({ sendPrompt: async () => { throw new Error("offline"); } });
+    await bad.hub.refresh(); await settle(bad.hub);
+    await assert.rejects(bad.hub.startSession({ repository: "o/r", number: 5 }));
+    assert.deepEqual(bad.writes, [["assign", "o/r", 5, "burkeholland"], ["unassign", "o/r", 5, "burkeholland"]]);
+});
+
+test("start_session on an issue that already has assignees only undoes what it added", async () => {
+    const ok = hubFixture();
+    await ok.hub.refresh(); await settle(ok.hub);
+    ok.assignees.set("o/r#5", ["jamesmontemagno"]);
+    await assert.rejects(ok.hub.startSession({ repository: "o/r", number: 5 }), error => error.code === "conflict", "the strict guard applies without additional");
+    const started = await ok.hub.startSession({ repository: "o/r", number: 5, additional: true });
+    assert.deepEqual(started.assignees, ["jamesmontemagno", "burkeholland"]);
+    assert.equal(started.added, true);
+    assert.deepEqual(ok.writes, [["assign", "o/r", 5, "burkeholland", "additional"]]);
+    const again = await ok.hub.startSession({ repository: "o/r", number: 5, additional: true });
+    assert.equal(again.added, false, "starting a session while already assigned is a no-op assignment, so the UI must not offer an undo");
+    assert.equal(ok.writes.length, 1);
+
+    const failing = hubFixture({ sendPrompt: async () => { throw new Error("offline"); } });
+    await failing.hub.refresh(); await settle(failing.hub);
+    failing.assignees.set("o/r#5", ["jamesmontemagno"]);
+    await assert.rejects(failing.hub.startSession({ repository: "o/r", number: 5, additional: true }), /assignment was undone/);
+    assert.deepEqual(failing.assignees.get("o/r#5"), ["jamesmontemagno"], "only my own assignment is rolled back");
+
+    failing.writes.length = 0;
+    failing.assignees.set("o/r#5", ["jamesmontemagno", "burkeholland"]);
+    await assert.rejects(failing.hub.startSession({ repository: "o/r", number: 5, additional: true }), error => /Could not start the session/.test(error.message) && !/undone/.test(error.message));
+    assert.deepEqual(failing.writes, [], "an assignment this call did not make is never rolled back");
+    assert.deepEqual(failing.assignees.get("o/r#5"), ["jamesmontemagno", "burkeholland"]);
+});
+
+test("start_session reports when the rollback unassign also fails", async () => {
+    const f = hubFixture({ sendPrompt: async () => { throw new Error("offline"); } });
+    await f.hub.refresh(); await settle(f.hub);
+    f.github.unassign = async () => { throw new Error("rate limited"); };
+    await assert.rejects(f.hub.startSession({ repository: "o/r", number: 5 }), error => /may still be assigned/.test(error.message) && !/was undone/.test(error.message));
+});
+
+test("set_tracking resolves repos, expands wildcards, then persists", async () => {
+    const { hub, store } = hubFixture();
+    await hub.refresh(); await settle(hub);
+    const s = await hub.setTracking({ repos: ["o/r", "O/brandnew", "o/web-*"] });
+    assert.deepEqual(store.data.repos, ["o/r", "o/brandnew", "o/web-app", "o/web-api"]);
+    assert.deepEqual(s.tracking.repos, store.data.repos);
+    assert.deepEqual((await hub.setTracking({ repos: ["o/r", "o/*"] })).tracking.repos, ["o/r", "o/web-app", "o/web-api", "o/webby", "o/other"], "overlaps are deduplicated");
+    await assert.rejects(hub.setTracking({ repos: ["o/missing"] }), error => error.code === "not_found");
+    await assert.rejects(hub.setTracking({ repos: ["o/nothing-*"] }), error => error.code === "not_found" && /No repositories match/.test(error.message));
+    await assert.rejects(hub.setTracking({ repos: ["ghost/x*"] }), error => error.code === "not_found");
+    await assert.rejects(hub.setTracking({ people: ["burkeholland"] }), error => error.code === "invalid_input");
+    assert.deepEqual(store.data.repos, ["o/r", "o/web-app", "o/web-api", "o/webby", "o/other"], "failed validation does not persist");
+});
+
+test("a wildcard that matches more than can be tracked is rejected with guidance", async () => {
+    const { hub, github, store } = hubFixture();
+    github.ownerRepos = async () => Array.from({ length: 20 }, (_, i) => `o/svc-${i}`);
+    await assert.rejects(hub.setTracking({ repos: ["o/svc-*"] }), error => error.code === "invalid_input" && /matches 20 repositories/.test(error.message));
+    assert.equal(store.data, null);
+});
+
+test("a failing repo keeps the rest of the dashboard working", async () => {
+    const { hub } = hubFixture({ failing: ["o/other"] });
+    await hub.setTracking({ repos: ["o/r", "o/other"] });
+    await settle(hub);
+    const s = hub.state();
+    assert.equal(s.repoStatus["o/r"].status, "ready");
+    assert.equal(s.repoStatus["o/other"].status, "error");
+    assert.equal(s.repoStatus["o/other"].error.code, "permission_denied");
+    assert.deepEqual(s.items.map(i => i.repository), ["o/r"]);
+});
+
+// ---------- momentum ----------
+
+const eventAt = (type, hoursAgo, key, actors) => ({ type, at: iso(hoursAgo), repository: key.split(/[@#]/)[0], key, actors });
+const momentumEvents = {
+    "o/r": [eventAt("commit", 2, "o/r@a", ["burkeholland"]), eventAt("prOpened", 3, "o/r#1", [AGENT]), eventAt("commit", 4, "o/r@b", [])],
+    "o/other": [eventAt("commit", 5, "o/other@c", ["jamesmontemagno"]), eventAt("commit", 6, "o/other@d", ["stranger"])],
+};
+
+async function momentumFixture(options = {}) {
+    const fixture = hubFixture({ events: momentumEvents, ...options });
+    await fixture.hub.setTracking({ repos: ["o/r", "o/other"], hidden: ["helper"] });
+    await settle(fixture.hub);
+    return fixture;
+}
+
+test("momentum aggregates the tracked repositories for the team, a person, or everyone", async () => {
+    const { hub, historyCalls } = await momentumFixture();
+    const team = await hub.momentum({ days: 7 });
+    assert.deepEqual(team.totals, { commits: 2, prsOpened: 1, prsMerged: 0, issuesOpened: 0, issuesCompleted: 0 });
+    assert.deepEqual(team.repositories, ["o/r", "o/other"]);
+    assert.deepEqual(team.errors, []);
+    assert.deepEqual(team.coverage, { truncated: [], unattributed: 1 });
+    assert.equal(team.series.length, 7);
+    assert.equal(team.since, "2026-10-14");
+    assert.equal(team.until, "2026-10-20");
+    assert.equal(team.fetchedAt, new Date(T).toISOString());
+    assert.equal((await hub.momentum({ days: 7, everyone: true })).totals.commits, 4);
+    assert.equal((await hub.momentum({ days: 7, person: "@JamesMontemagno" })).totals.commits, 1);
+    assert.equal((await hub.momentum({ days: 7, person: AGENT })).totals.prsOpened, 1);
+    const one = await hub.momentum({ days: 7, repository: "O/Other" });
+    assert.deepEqual(one.repositories, ["o/other"]);
+    assert.equal(one.totals.commits, 1);
+    await assert.rejects(hub.momentum({ repository: "o/untracked" }), error => error.code === "invalid_input");
+    await assert.rejects(hub.momentum({ days: 5 }), error => error.code === "invalid_input");
+    assert.equal(historyCalls.length, 2, "one fetch per tracked repository, shared by every scope");
+});
+
+test("momentum reuses wider cached windows and refetches for wider, forced or expired requests", async () => {
+    let clock = T;
+    const { hub, historyCalls } = await momentumFixture({ now: () => clock });
+    await hub.momentum({ days: 30 });
+    assert.deepEqual(historyCalls.map(call => call[1]), [30, 30]);
+    await hub.momentum({ days: 7 });
+    await hub.momentum({ days: 30, person: AGENT });
+    assert.equal(historyCalls.length, 2, "a cached 30 day window serves 7 and 30 day requests");
+    await hub.momentum({ days: 90 });
+    assert.equal(historyCalls.length, 4, "a wider window needs a new fetch");
+    await hub.momentum({ days: 7, force: true });
+    assert.equal(historyCalls.length, 6, "force refetches");
+    await hub.momentum({ days: 7 });
+    assert.equal(historyCalls.length, 6, "the forced result is what later reads use");
+    clock += 59 * 60_000;
+    await hub.momentum({ days: 7 });
+    assert.equal(historyCalls.length, 6, "history stays cached for the whole hour");
+    await hub.refresh({ force: true });
+    await settle(hub);
+    await hub.momentum({ days: 7 });
+    assert.equal(historyCalls.length, 6, "refreshing the dashboard does not refetch history");
+    clock += 2 * 60_000;
+    await hub.momentum({ days: 7 });
+    assert.equal(historyCalls.length, 8, "entries older than an hour refetch");
+});
+
+test("momentum shares one in-flight fetch per repository", async () => {
+    const f = await momentumFixture();
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const original = f.github.history;
+    f.github.history = async (...args) => { await gate; return original(...args); };
+    const wide = f.hub.momentum({ days: 30 });
+    const narrow = f.hub.momentum({ days: 7, everyone: true });
+    const forced = f.hub.momentum({ days: 7, force: true });
+    release();
+    const [a, b, c] = await Promise.all([wide, narrow, forced]);
+    assert.equal(f.historyCalls.length, 2, "narrower and forced requests join the wider fetch already running");
+    assert.equal(a.totals.commits, 2);
+    assert.equal(b.totals.commits, 4);
+    assert.equal(c.totals.commits, 2);
+});
+
+test("momentum falls back to cached data when a refresh fails, and reports repositories it cannot read", async () => {
+    const f = await momentumFixture();
+    const first = await f.hub.momentum({ days: 7 });
+    f.github.history = async () => { throw new TeamLoadError("rate_limit", "slow down"); };
+    const stale = await f.hub.momentum({ days: 7, force: true });
+    assert.deepEqual(stale.totals, first.totals, "cached data is still shown");
+    assert.deepEqual(stale.errors.map(error => [error.repository, error.code, error.stale]), [["o/r", "rate_limit", true], ["o/other", "rate_limit", true]]);
+
+    const partial = await momentumFixture();
+    partial.github.history = async name => {
+        if (name === "o/other") throw new TeamLoadError("permission_denied", "no access");
+        return { events: momentumEvents[name], truncated: true };
+    };
+    const result = await partial.hub.momentum({ days: 7 });
+    assert.deepEqual(result.errors, [{ repository: "o/other", code: "permission_denied", message: "no access", stale: false }]);
+    assert.equal(result.totals.commits, 1, "the readable repository still reports");
+    assert.deepEqual(result.coverage.truncated, ["o/r"]);
+    assert.equal(partial.hub.state().repoStatus["o/r"].status, "ready", "history problems do not mark the dashboard as failing");
+});
+
+test("untracking a repository drops its cached history", async () => {
+    const f = await momentumFixture();
+    await f.hub.momentum({ days: 7 });
+    assert.equal(f.historyCalls.length, 2);
+    await f.hub.setTracking({ repos: ["o/r"] });
+    await settle(f.hub);
+    await f.hub.setTracking({ repos: ["o/r", "o/other"] });
+    await settle(f.hub);
+    await f.hub.momentum({ days: 7 });
+    assert.deepEqual(f.historyCalls.slice(2).map(call => call[0]), ["o/other"], "only the re-tracked repository is fetched again");
+});
+
+// ---------- server ----------
+
+test("perform exposes get_momentum with validated input", async () => {
+    const f = await momentumFixture();
+    const result = await perform({ hub: f.hub }, "get_momentum", { days: 7 });
+    assert.equal(result.days, 7);
+    assert.equal((await perform({ hub: f.hub }, "get_momentum", {})).days, 7, "seven days unless asked otherwise");
+    await assert.rejects(perform({ hub: f.hub }, "get_momentum", { days: 1 }), error => error.code === "invalid_input");
+    await assert.rejects(perform({ hub: f.hub }, "get_momentum", { person: "a", everyone: true }), error => error.code === "invalid_input");
+});
+test("perform validates action names and refresh input", async () => {
+    const { hub } = hubFixture();
+    await assert.rejects(perform({ hub }, "drop_tables", {}), error => error.code === "invalid_input");
+    await assert.rejects(perform({ hub }, "refresh", { force: "yes" }), error => error.code === "invalid_input");
+    await assert.rejects(perform({ hub }, "get_state", { extra: 1 }), error => error.code === "invalid_input");
+    assert.equal(statusFor(new TeamLoadError("conflict", "x")), 409);
+    assert.equal(statusFor(new TeamLoadError("rate_limit", "x")), 429);
+    assert.equal(statusFor(new Error("boom")), 500);
+});
+
+test("renderer escapes nothing user-controlled and locks theme only for known values", () => {
+    assert.match(renderHtml("abc", "dark"), /data-theme="dark" data-theme-locked/);
+    assert.doesNotMatch(renderHtml("abc", "<x>"), /data-theme/);
+    assert.doesNotMatch(renderHtml("abc"), /<script>(?!<\/script>)/);
+});
+
+test("renderer places the accessible theme toggle beside Refresh", () => {
+    assert.match(renderHtml("abc"), /id="theme-toggle" aria-label="Switch theme"><\/button>\s*<button[^>]+id="refresh"/);
+});
+
+test("server enforces nonce, host, origin and CSP", async () => {
+    const { hub } = hubFixture();
+    const server = await startServer(() => ({ hub }));
+    try {
+        const page = await fetch(server.url);
+        assert.equal(page.status, 200);
+        assert.equal(page.headers.get("content-security-policy"), CSP);
+        assert.doesNotMatch(CSP, /unsafe-inline|frame-ancestors \*/);
+        const html = await page.text();
+        const nonce = html.match(/name="team-load-nonce" content="([^"]+)"/)[1];
+        const call = (headers, body = { action: "get_state", input: {} }) => fetch(new URL("/api/action", server.url), { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+        assert.equal((await call({})).status, 403);
+        assert.equal((await call({ "x-team-load-nonce": "wrong" })).status, 403);
+        assert.equal((await call({ "x-team-load-nonce": nonce, origin: "https://evil.example" })).status, 403);
+        const ok = await call({ "x-team-load-nonce": nonce });
+        assert.equal(ok.status, 200);
+        assert.ok(Array.isArray((await ok.json()).tracking.people));
+        assert.equal((await call({ "x-team-load-nonce": nonce }, { action: "assign", input: { repository: "o/r", number: 5, login: "stranger" } })).status, 400);
+        for (const asset of ["/app.mjs", "/model.mjs", "/icons.mjs", "/markdown.mjs", "/momentum.mjs", "/styles.css"]) assert.equal((await fetch(new URL(asset, server.url))).status, 200, asset);
+        assert.equal((await fetch(new URL("/config.json", server.url))).status, 404);
+        assert.equal((await fetch(new URL("/../state.mjs", server.url))).status, 404);
+    } finally { await server.close(); }
+});
+
+test("a write during an in-flight fetch returns post-write state, not the stale fetch", async () => {
+    let release;
+    const assignees = [];
+    let calls = 0;
+    const github = {
+        fetchRepo: async name => {
+            calls++;
+            const snapshot = [...assignees];
+            if (calls === 2) await new Promise(r => { release = r; });
+            return [normalizeIssue({ ...issueNode(5), assignees: { nodes: snapshot.map(login => ({ login })) } }, name)];
+        },
+        repoInfo: async name => ({ nameWithOwner: name, url: "u", open: 1, actors: [{ login: "burkeholland", name: "Burke", avatarUrl: null, agent: false }] }),
+        viewerRepos: async () => [],
+        profile: async login => ({ login, name: login, avatarUrl: null }),
+        me: async () => "burkeholland",
+        assign: async ({ login }) => { assignees.push(login); return { assignees: [login] }; },
+        unassign: async () => ({ assignees: [] }),
+    };
+    const store = { read: async () => ({ repos: ["o/r"], hidden: [], knownRepos: [], limit: 6, refreshSeconds: 300 }), write: async v => v };
+    const gated = createHub({ store, github, sendPrompt: async () => {}, now: () => T });
+    await gated.refresh(); await settle(gated);
+    await gated.refresh({ force: true }); // starts fetch #2, which snapshots "unassigned" and hangs
+    const write = gated.assign({ repository: "o/r", number: 5, login: "burkeholland" });
+    await new Promise(r => setTimeout(r, 5));
+    release();
+    const result = await write;
+    assert.deepEqual(result.state.items[0].assignees, ["burkeholland"]);
+    assert.equal(calls, 3, "a fresh fetch ran after the write");
+});
+
+test("when every repo fails, status is error (not loading) so the UI can show it", async () => {
+    const { hub } = hubFixture({ failing: ["o/r"] });
+    await hub.refresh(); await settle(hub);
+    const status = hub.state().repoStatus["o/r"];
+    assert.equal(status.status, "error");
+    assert.equal(status.error.message, "no access");
+});
+
+
+// ---- Detail-view edits ----
+function editServer({ isPr = false, merged = false, state = "open", labels = ["bug"], commentAuthor = "burkeholland", commentIssue = 5 } = {}) {
+    const item = { state, labels: [...labels] };
+    const { run, calls } = fakeGh({
+        "issues/comments/77": ({ args }) => args.includes("DELETE") ? "" : { issue_url: `https://api.github.com/repos/o/r/issues/${commentIssue}`, user: { login: commentAuthor } },
+        "issues/5/comments": ({ options }) => ({ id: 9, html_url: "u", created_at: iso(1), body_html: `<p>${JSON.parse(options.input).body}</p>`, user: { login: "burkeholland", avatar_url: "a" } }),
+        "issues/5/labels": ({ args, options }) => {
+            if (args.includes("POST")) item.labels.push(...JSON.parse(options.input).labels);
+            else item.labels = item.labels.filter(l => l !== decodeURIComponent(args.at(-1).split("/").pop()));
+            return [];
+        },
+        "issues/5/assignees": () => ({}),
+        "repos/o/r/issues/5": () => ({ state: item.state, pull_request: isPr ? { merged_at: merged ? iso(1) : null } : undefined, labels: item.labels.map(name => ({ name })), assignees: [] }),
+        "api --hostname github.com user": () => ({ login: "BurkeHolland" }),
+        "labels(first": () => ({ data: { repository: { labels: page([{ name: "bug", color: "d73a4a", description: "Broken" }, { name: "good first issue", color: "7057ff", description: "" }]) } } }),
+        " close 5": () => { item.state = "closed"; return ""; },
+        " reopen 5": () => { item.state = "open"; return ""; },
+    });
+    return { run, calls, item };
+}
+
+test("comment posts the body over stdin and asks for rendered HTML", async () => {
+    const server = editServer();
+    const gh = createGitHub({ run: server.run });
+    const created = await gh.comment({ repository: "o/r", number: 5, body: "Hi `x`" });
+    const call = server.calls.find(args => args.some(a => a.endsWith("/comments")));
+    assert.ok(call.includes("POST") && call.includes("--input") && call.includes("Accept: application/vnd.github.html+json"));
+    assert.equal(created.id, 9);
+    assert.equal(created.canDelete, true);
+    assert.equal(created.bodyHTML, "<p>Hi `x`</p>");
+});
+
+test("deleteComment only removes the viewer's own comment on the same item", async () => {
+    const mine = editServer();
+    assert.deepEqual(await createGitHub({ run: mine.run }).deleteComment({ repository: "o/r", number: 5, commentId: 77 }), { deleted: 77 });
+    assert.ok(mine.calls.some(args => args.includes("DELETE")));
+    const theirs = editServer({ commentAuthor: "someone" });
+    await assert.rejects(createGitHub({ run: theirs.run }).deleteComment({ repository: "o/r", number: 5, commentId: 77 }), error => error.code === "permission_denied");
+    const elsewhere = editServer({ commentIssue: 6 });
+    await assert.rejects(createGitHub({ run: elsewhere.run }).deleteComment({ repository: "o/r", number: 5, commentId: 77 }), error => error.code === "invalid_input");
+    for (const s of [theirs, elsewhere]) assert.ok(!s.calls.some(args => args.includes("DELETE")));
+});
+
+test("editLabel adds and removes known labels, is idempotent, and never creates new ones", async () => {
+    const server = editServer();
+    const gh = createGitHub({ run: server.run });
+    assert.deepEqual(await gh.editLabel({ repository: "o/r", number: 5, label: "Good First Issue", add: true }), { labels: [{ name: "bug", color: "d73a4a" }, { name: "good first issue", color: "7057ff" }] });
+    const writes = () => server.calls.filter(args => args.includes("POST") || args.includes("DELETE")).length;
+    assert.equal(writes(), 1);
+    await gh.editLabel({ repository: "o/r", number: 5, label: "bug", add: true });
+    assert.equal(writes(), 1, "already applied: no write");
+    assert.deepEqual((await gh.editLabel({ repository: "o/r", number: 5, label: "good first issue", add: false })).labels.map(l => l.name), ["bug"]);
+    assert.ok(server.calls.some(args => args.at(-1) === "repos/o/r/issues/5/labels/good%20first%20issue"));
+    await assert.rejects(gh.editLabel({ repository: "o/r", number: 5, label: "made-up", add: true }), error => error.code === "invalid_input");
+    assert.equal(writes(), 2);
+});
+
+test("repository labels paginate before caching and allow labels beyond the first hundred", async () => {
+    const first = Array.from({ length: 100 }, (_, i) => ({ name: `label-${i}`, color: "d73a4a" }));
+    const last = { name: "z-last", color: "7057ff", description: "On page two" };
+    const applied = [];
+    const { run, calls } = fakeGh({
+        "labels(first": ({ vars }) => ({ data: { repository: { labels: vars.after ? page([last]) : page(first, "next-labels") } } }),
+        "issues/5/labels": ({ options }) => { applied.push(...JSON.parse(options.input).labels); return []; },
+        "repos/o/r/issues/5": () => ({ state: "open", labels: applied.map(name => ({ name })) }),
+    });
+    const gh = createGitHub({ run });
+    const labels = await gh.repoLabels("o/r");
+    assert.equal(labels.length, 101);
+    assert.equal(labels.at(-1).description, "On page two");
+    assert.equal(await gh.repoLabels("O/R"), labels, "cache the complete list case-insensitively");
+    assert.deepEqual((await gh.editLabel({ repository: "o/r", number: 5, label: "Z-LAST", add: true })).labels, [{ name: "z-last", color: "7057ff" }]);
+    assert.equal(calls.filter(args => args.some(arg => arg.startsWith("query="))).length, 2);
+    assert.ok(calls.some(args => args.includes("after=next-labels")));
+});
+
+test("a failed label page is not cached as a complete list", async () => {
+    let fail = true;
+    const { run, calls } = fakeGh({
+        "labels(first": ({ vars }) => {
+            if (vars.after && fail) throw new TeamLoadError("permission_denied", "Labels unavailable");
+            return { data: { repository: { labels: vars.after ? page([{ name: "last", color: "7057ff" }]) : page([], "next") } } };
+        },
+    });
+    const gh = createGitHub({ run });
+    await assert.rejects(gh.repoLabels("o/r"), /Labels unavailable/);
+    fail = false;
+    assert.equal((await gh.repoLabels("o/r"))[0].name, "last");
+    assert.equal(calls.length, 4);
+});
+
+test("repository label coverage limits fail explicitly rather than caching a partial list", async () => {
+    const { run } = fakeGh({
+        "labels(first": () => ({ data: { repository: { labels: page([], "more") } } }),
+    });
+    await assert.rejects(createGitHub({ run }).repoLabels("o/r"), error => error.code === "coverage_limit" && /labels/.test(error.message));
+});
+
+test("setState closes and reopens issues and PRs, and refuses merged PRs", async () => {
+    const issue = editServer();
+    const gh = createGitHub({ run: issue.run });
+    assert.deepEqual(await gh.setState({ repository: "o/r", number: 5, state: "closed" }), { itemState: "closed" });
+    assert.ok(issue.calls.some(args => args.join(" ") === "issue close 5 --repo o/r"));
+    await gh.setState({ repository: "o/r", number: 5, state: "closed" });
+    assert.equal(issue.calls.filter(args => args[1] === "close").length, 1, "no-op when already closed");
+    const pr = editServer({ isPr: true });
+    await createGitHub({ run: pr.run }).setState({ repository: "o/r", number: 5, state: "closed" });
+    assert.ok(pr.calls.some(args => args.join(" ") === "pr close 5 --repo o/r"));
+    const merged = editServer({ isPr: true, merged: true, state: "closed" });
+    await assert.rejects(createGitHub({ run: merged.run }).setState({ repository: "o/r", number: 5, state: "open" }), error => error.code === "conflict");
+});
+
+test("PR assignees go through REST, and Copilot or session starts stay issue-only", async () => {
+    let assignees = [];
+    const { run, calls } = fakeGh({
+        "issues/5/assignees": ({ args, options }) => { const [login] = JSON.parse(options.input).assignees; assignees = args.includes("POST") ? [...assignees, login] : assignees.filter(l => l !== login); return {}; },
+        "repos/o/r/issues/5": () => ({ state: "open", pull_request: {}, assignees: assignees.map(login => ({ login })) }),
+    });
+    const gh = createGitHub({ run });
+    assert.deepEqual(await gh.assign({ repository: "o/r", number: 5, login: "jamesmontemagno", additional: true }), { assignees: ["jamesmontemagno"], added: true });
+    assert.ok(!calls.some(args => args[0] === "issue" || args[0] === "pr"));
+    await gh.unassign({ repository: "o/r", number: 5, login: "jamesmontemagno" });
+    assert.deepEqual(assignees, []);
+    await assert.rejects(gh.assign({ repository: "o/r", number: 5, login: AGENT, additional: true }), /only be assigned to issues/);
+    await assert.rejects(gh.assign({ repository: "o/r", number: 5, login: "burkeholland", additional: true, issuesOnly: true }), /Sessions can only be started for issues/);
+});
+
+test("validateEdit checks each edit's fields", () => {
+    const ref = { repository: "o/r", number: 5 };
+    assert.equal(validateEdit({ ...ref, body: "hi" }, "comment").body, "hi");
+    for (const bad of [{ ...ref, body: "  " }, { ...ref, body: "x".repeat(65537) }, { ...ref, body: "x", extra: 1 }]) assert.throws(() => validateEdit(bad, "comment"), error => error.code === "invalid_input");
+    assert.equal(validateEdit({ ...ref, commentId: 3 }, "delete_comment").commentId, 3);
+    assert.throws(() => validateEdit({ ...ref, commentId: "3" }, "delete_comment"));
+    assert.equal(validateEdit({ ...ref, label: "bug", add: false }, "label").add, false);
+    assert.throws(() => validateEdit({ ...ref, label: "bug" }, "label"));
+    assert.equal(validateEdit({ ...ref, state: "closed" }, "set_item_state").state, "closed");
+    assert.throws(() => validateEdit({ ...ref, state: "merged" }, "set_item_state"));
+});
+
+function editHub() {
+    const f = hubFixture();
+    const edits = [];
+    Object.assign(f.github, {
+        comment: async input => { edits.push(["comment", input.repository, input.number]); return { id: 1, bodyHTML: "", createdAt: iso(1), canDelete: true, author: null }; },
+        deleteComment: async input => { edits.push(["delete", input.commentId]); return { deleted: input.commentId }; },
+        repoLabels: async () => [{ name: "bug", color: "d73a4a", description: "" }],
+        editLabel: async input => { edits.push(["label", input.label, input.add]); return { labels: [{ name: input.label, color: "d73a4a" }] }; },
+        setState: async input => { edits.push(["state", input.state]); return { itemState: input.state }; },
+    });
+    return { ...f, edits };
+}
+
+test("detail edits route through the server, stay inside tracked repos, and refresh", async () => {
+    const f = editHub();
+    await f.hub.refresh(); await settle(f.hub);
+    const ctx = { hub: f.hub };
+    assert.equal((await perform(ctx, "comment", { repository: "O/R", number: 5, body: "hi" })).comment.id, 1);
+    await perform(ctx, "delete_comment", { repository: "o/r", number: 5, commentId: 1 });
+    assert.equal((await perform(ctx, "get_labels", { repository: "o/r" })).labels[0].name, "bug");
+    const labelled = await perform(ctx, "label", { repository: "o/r", number: 5, label: "bug", add: true });
+    assert.ok(labelled.state && labelled.labels.length === 1);
+    const closed = await perform(ctx, "set_item_state", { repository: "o/r", number: 5, state: "closed" });
+    assert.equal(closed.itemState, "closed");
+    assert.ok(closed.state);
+    assert.deepEqual(f.edits, [["comment", "o/r", 5], ["delete", 1], ["label", "bug", true], ["state", "closed"]]);
+    for (const [action, input] of [["comment", { body: "x" }], ["delete_comment", { commentId: 1 }], ["label", { label: "bug", add: true }], ["set_item_state", { state: "open" }]]) {
+        await assert.rejects(perform(ctx, action, { repository: "o/other", number: 5, ...input }), error => error.code === "invalid_input");
+    }
+    await assert.rejects(perform(ctx, "get_labels", { repository: "o/other" }), error => error.code === "invalid_input");
+    assert.equal(f.edits.length, 4);
+});
+
+// ---- Bulk local sessions ----
+test("validateSessionBatch requires 1-10 distinct issue refs", () => {
+    assert.deepEqual(validateSessionBatch({ items: [{ repository: "o/r", number: 1, title: "A" }, { repository: "O/R", number: 1 }] }), [{ repository: "o/r", number: 1, title: "A" }]);
+    for (const bad of [{}, { items: [] }, { items: "x" }, { items: [{ repository: "o/r", number: 1 }], extra: 1 }, { items: [{ repository: "o/r", number: 0 }] }, { items: Array.from({ length: MAX_SESSION_BATCH + 1 }, (_, i) => ({ repository: "o/r", number: i + 1 })) }]) {
+        assert.throws(() => validateSessionBatch(bad), error => error.code === "invalid_input");
+    }
+});
+
+test("start_sessions claims every issue and sends one prompt listing them all", async () => {
+    const prompts = [];
+    const f = hubFixture({ sendPrompt: async prompt => prompts.push(prompt), issues: { "o/r": [issueNode(5), issueNode(6, ["jamesmontemagno"])] } });
+    await f.hub.refresh(); await settle(f.hub);
+    const result = await perform({ hub: f.hub }, "start_sessions", { items: [{ repository: "o/r", number: 5, title: "Fix \"it\"" }, { repository: "o/r", number: 6, title: "Other" }] });
+    assert.deepEqual(result.started, [{ repository: "o/r", number: 5 }, { repository: "o/r", number: 6 }]);
+    assert.deepEqual(f.writes, [["assign", "o/r", 5, "burkeholland", "additional"], ["assign", "o/r", 6, "burkeholland", "additional"]]);
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0], /2 local Copilot coding sessions/);
+    assert.match(prompts[0], /1\. o\/r#5 title="Fix \\"it\\"" url=https:\/\/github\.com\/o\/r\/issues\/5/);
+    assert.match(prompts[0], /2\. o\/r#6 title="Other" url=https:\/\/github\.com\/o\/r\/issues\/6/);
+    assert.ok(result.state.items.find(i => i.number === 6).assignees.includes("burkeholland"));
+});
+
+test("start_sessions rolls back only what it added when the send fails", async () => {
+    const f = hubFixture({ sendPrompt: async () => { throw new Error("offline"); }, issues: { "o/r": [issueNode(5), issueNode(6)] } });
+    await f.hub.refresh(); await settle(f.hub);
+    f.assignees.set("o/r#6", ["burkeholland"]);
+    await assert.rejects(f.hub.startSessions({ items: [{ repository: "o/r", number: 5 }, { repository: "o/r", number: 6 }] }), error => error.code === "session_unavailable" && /undone/.test(error.message));
+    assert.deepEqual(f.writes, [["assign", "o/r", 5, "burkeholland", "additional"], ["unassign", "o/r", 5, "burkeholland"]]);
+    assert.deepEqual(f.assignees.get("o/r#6"), ["burkeholland"], "an existing assignment is left alone");
+});
+
+test("start_sessions is all or nothing when a claim fails, and rejects untracked repos up front", async () => {
+    const prompts = [];
+    const f = hubFixture({ sendPrompt: async prompt => prompts.push(prompt), issues: { "o/r": [issueNode(5), issueNode(6)] } });
+    await f.hub.refresh(); await settle(f.hub);
+    const assign = f.github.assign;
+    f.github.assign = async input => { if (input.number === 6) throw new TeamLoadError("conflict", "o/r#6 is closed."); return assign(input); };
+    await assert.rejects(f.hub.startSessions({ items: [{ repository: "o/r", number: 5 }, { repository: "o/r", number: 6 }] }), error => error.code === "conflict" && /o\/r#6.*no sessions were started/.test(error.message));
+    assert.deepEqual(f.writes, [["assign", "o/r", 5, "burkeholland", "additional"], ["unassign", "o/r", 5, "burkeholland"]]);
+    assert.equal(prompts.length, 0);
+    await assert.rejects(f.hub.startSessions({ items: [{ repository: "o/r", number: 5 }, { repository: "o/other", number: 1 }] }), error => error.code === "invalid_input");
+    assert.equal(f.writes.length, 2, "nothing claimed when a repo is untracked");
+});
+
+for (const failure of ["verification", "write response"]) {
+    test(`start_sessions compensates for a failed ${failure} after a claim reaches GitHub`, async () => {
+        const prompts = [];
+        const f = hubFixture({ sendPrompt: async prompt => prompts.push(prompt), issues: { "o/r": [issueNode(5), issueNode(6), issueNode(7)] } });
+        f.assignees.set("o/r#5", ["burkeholland", "helper"]);
+        f.assignees.set("o/r#7", ["helper"]);
+        const { run, calls } = fakeGh({
+            "issue edit": ({ args }) => {
+                const key = `o/r#${args[2]}`;
+                const current = f.assignees.get(key) ?? [];
+                f.assignees.set(key, args.includes("--add-assignee") ? [...current, args.at(-1)] : current.filter(login => login !== args.at(-1)));
+                if (args[2] === "7" && args.includes("--add-assignee") && failure === "write response") throw new Error("Write response lost");
+                return "";
+            },
+            "repos/o/r/issues/": ({ args }) => {
+                const number = Number(args.at(-1).split("/").at(-1));
+                const assignees = f.assignees.get(`o/r#${number}`) ?? [];
+                if (number === 7 && assignees.includes("burkeholland")) throw new Error("Verification failed");
+                return { state: "open", assignees: assignees.map(login => ({ login })) };
+            },
+        });
+        const gh = createGitHub({ run });
+        Object.assign(f.github, { assign: gh.assign, unassign: gh.unassign });
+        await assert.rejects(f.hub.startSessions({ items: [5, 6, 7].map(number => ({ repository: "o/r", number })) }), /no sessions were started/);
+        assert.equal(prompts.length, 0);
+        assert.deepEqual(f.assignees.get("o/r#5"), ["burkeholland", "helper"], "leave the pre-existing viewer assignment alone");
+        assert.deepEqual(f.assignees.get("o/r#6"), [], "roll back earlier successful claims");
+        assert.deepEqual(f.assignees.get("o/r#7"), ["helper"], "roll back the failing claim without removing other assignees");
+        assert.deepEqual(calls.filter(args => args[0] === "issue").map(args => [args[2], args.at(-2)]), [
+            ["6", "--add-assignee"], ["7", "--add-assignee"], ["7", "--remove-assignee"], ["6", "--remove-assignee"],
+        ]);
+    });
+}
+
+test("an unverified claim rollback reports the affected issue and both failures", async () => {
+    let written = false;
+    const { run } = fakeGh({
+        "repos/o/r/issues/5": () => {
+            if (written) throw new Error("Verification failed");
+            return { state: "open", assignees: [] };
+        },
+        "issue edit": ({ args }) => {
+            if (args.includes("--remove-assignee")) throw new Error("Removal denied");
+            written = true;
+            return "";
+        },
+    });
+    await assert.rejects(createGitHub({ run }).assign({ repository: "o/r", number: 5, login: "burkeholland", additional: true, rollbackOnFailure: true }),
+        error => error.code === "write_uncertain" && /o\/r#5/.test(error.message) && /Verification failed/.test(error.message) && /Removal denied/.test(error.message));
+});
+
+test("the action endpoint accepts long comments but caps bodies at 256 KiB", async () => {
+    const f = editHub();
+    await f.hub.refresh(); await settle(f.hub);
+    const server = await startServer(() => ({ hub: f.hub }));
+    try {
+        const nonce = (await (await fetch(server.url)).text()).match(/name="team-load-nonce" content="([^"]+)"/)[1];
+        const call = body => fetch(new URL("/api/action", server.url), { method: "POST", headers: { "content-type": "application/json", "x-team-load-nonce": nonce }, body: JSON.stringify({ action: "comment", input: { repository: "o/r", number: 5, body } }) });
+        assert.equal((await call("x".repeat(60000))).status, 200);
+        assert.notEqual((await call("x".repeat(300000))).status, 200);
+    } finally { await server.close(); }
+});
+
+test("labelSummary shows two labels, a +N count and the full list for the tooltip", () => {
+    const l = n => ({ name: n, color: "0e8a16" });
+    assert.deepEqual(labelSummary([]), { shown: [], more: 0, title: "" });
+    assert.deepEqual(labelSummary(undefined), { shown: [], more: 0, title: "" });
+    assert.deepEqual(labelSummary([l("bug")]), { shown: [l("bug")], more: 0, title: "bug" });
+    const four = labelSummary([l("bug"), l("mac"), l("windows"), l("2.0 Launch")]);
+    assert.deepEqual(four.shown.map(x => x.name), ["bug", "mac"]);
+    assert.equal(four.more, 2);
+    assert.equal(four.title, "bug, mac, windows, 2.0 Launch");
+    assert.equal(labelSummary([l("a"), l("b"), l("c")], 1).more, 2);
+    assert.deepEqual(labelSummary([l("a"), { name: "  " }, null]).shown.map(x => x.name), ["a"]);
+});
+
+test("planRowUpdate patches only changed rows and rebuilds on reorder", async () => {
+    const { planRowUpdate } = await import("../model.mjs");
+    const a = [{ key: "a", html: "1" }, { key: "b", html: "2" }];
+    assert.deepEqual(planRowUpdate(a, [{ key: "a", html: "1" }, { key: "b", html: "2" }]), []);
+    assert.deepEqual(planRowUpdate(a, [{ key: "a", html: "1" }, { key: "b", html: "3" }]), [1]);
+    assert.equal(planRowUpdate(a, [{ key: "b", html: "2" }, { key: "a", html: "1" }]), null);
+    assert.equal(planRowUpdate(a, [{ key: "a", html: "1" }]), null);
+    assert.equal(planRowUpdate([], []).length, 0);
+});
+
+test("person row toggle stays easy to hit", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const css = await readFile(new URL("../assets/styles.css", import.meta.url), "utf8");
+    const app = await readFile(new URL("../assets/app.mjs", import.meta.url), "utf8");
+    assert.match(css, /\.chev-box\s*\{[^}]*width:\s*32px;[^}]*height:\s*32px/);
+    assert.match(css, /\.person-toggle::after\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0/);
+    assert.match(css, /\.person-row\s*\{[^}]*cursor:\s*pointer/);
+    for (const cols of css.matchAll(/\.person-row[^{]*\{[^}]*grid-template-columns:([^;]+);/g)) assert.match(cols[1], /32px\s*$/, cols[1]);
+    // Background refreshes must not swap rows out mid-click.
+    assert.match(app, /if \(rosterHeld\) \{ rosterPending = true; return; \}/);
+    assert.match(app, /aria-expanded="\$\{open\}"/);
+});
+
+test("expanded item lists start at the card edge and labels shrink before titles", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const css = await readFile(new URL("../assets/styles.css", import.meta.url), "utf8");
+    assert.match(css, /\.detail \{ padding: 2px 16px 10px; /);
+    assert.match(css, /\.item > \.lbls \{[^}]*flex: 0 10000 auto/);
+    assert.match(css, /\.item > \.item-title \{ flex: 0 1 auto; min-width: 0; \}/);
+    const app = await readFile(new URL("../assets/app.mjs", import.meta.url), "utf8");
+    // +N sits outside the shrinking pill strip so it never gets clipped.
+    assert.match(app, /<\/span>\$\{more \? `<span class="lbl-more"/);
+});
+
+const appSource = await readFile(new URL("../assets/app.mjs", import.meta.url), "utf8");
+const flushClient = () => new Promise(resolve => setImmediate(resolve));
+
+function clientElement() {
+    const classes = new Set();
+    const attributes = new Map();
+    return {
+        dataset: {}, children: [], hidden: true, innerHTML: "", value: "",
+        classList: {
+            add: name => classes.add(name),
+            remove: name => classes.delete(name),
+            contains: name => classes.has(name),
+            toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
+        },
+        setAttribute: (name, value) => attributes.set(name, value),
+        getAttribute: name => attributes.get(name),
+        hasAttribute: name => attributes.has(name),
+        addEventListener() {},
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        contains: () => false,
+    };
+}
+
+function clientFixture() {
+    const elements = new Map(["theme-toggle", "roster", "scope-q", "scope-backdrop", "detail", "person", "home", "tickets", "triage-count", "triage-all", "bulkbar", "toast", "composer-text"].map(id => [id, clientElement()]));
+    const requests = [];
+    const app = runInNewContext(
+        appSource.split("// ---- Boot ----")[0].replace(/^import .+ from ".+";\r?$/gm, "") + `
+        renderMeta = () => {};
+        renderRoster = () => {};
+        fitNow = () => {};
+        ({
+            setState(next) { S = next; compute(); },
+            view(key, data = null) { route.item = key; route.data = data; },
+            setSelected, renderTriage, startSessions, toggleLabel, postComment,
+            undo: () => undoAction?.(), busy, drafts,
+        });`,
+        {
+            AGENT, canonLogin, computeLoad, loadOf, tone, meterScale, sortRoster, sortForAssign,
+            ago, shortRepo, parseItemUrl, loginPattern, repoPattern, labelSummary, planRowUpdate, ICONS: {},
+            document: {
+                documentElement: clientElement(), body: clientElement(), activeElement: null,
+                getElementById: id => elements.get(id) ?? null,
+                querySelector: () => ({ content: "test-nonce" }),
+                addEventListener() {},
+            },
+            window: { addEventListener() {} }, history: {}, addEventListener() {},
+            matchMedia: () => ({ matches: false, addEventListener() {} }),
+            ResizeObserver: class { observe() {} },
+            localStorage: { getItem: () => null, setItem() {} },
+            setTimeout: () => 1, clearTimeout() {},
+            fetch: async (url, options) => {
+                const deferred = Promise.withResolvers();
+                requests.push({ ...JSON.parse(options.body), ...deferred });
+                return { ok: true, json: () => deferred.promise };
+            },
+        },
+    );
+    return { app, elements, requests };
+}
+
+function clientState(assignees = []) {
+    return {
+        items: [normalizeIssue(issueNode(5, assignees), "o/r")],
+        tracking: { repos: ["o/r"], people: ["burkeholland"], hidden: [] },
+        directory: { people: [], repos: [] }, repoStatus: { "o/r": { status: "ready" } },
+    };
+}
+
+test("selecting an assigned issue exposes bulk controls even when triage is empty", () => {
+    const f = clientFixture();
+    f.app.setState(clientState(["burkeholland"]));
+    f.app.setSelected(["o/r#5"], true);
+    assert.equal(f.elements.get("bulkbar").hidden, false);
+    assert.match(f.elements.get("bulkbar").innerHTML, /Start 1 Copilot session/);
+    assert.equal(f.elements.get("triage-all").hidden, true);
+});
+
+test("bulk controls clear after starting the last unowned issue", async () => {
+    const f = clientFixture();
+    f.app.setState(clientState());
+    f.app.setSelected(["o/r#5"], true);
+    const pending = f.app.startSessions();
+    assert.match(f.elements.get("bulkbar").innerHTML, /Starting/);
+    f.requests[0].resolve({ state: clientState(["burkeholland"]), login: "burkeholland" });
+    await pending;
+    assert.equal(f.elements.get("bulkbar").hidden, true);
+    assert.equal(f.elements.get("triage-all").hidden, true);
+    assert.equal(f.app.busy.size, 0);
+});
+
+for (const target of [null, "o/r#6"]) {
+    test(`label Undo targets the original operation after navigating to ${target ?? "home"}`, async () => {
+        const f = clientFixture();
+        const data = { labels: [] };
+        const state = clientState();
+        f.app.setState(state);
+        f.app.view("o/r#5", data);
+        const pending = f.app.toggleLabel("o/r#5", "bug");
+        f.requests[0].resolve({ labels: [{ name: "bug" }], state });
+        await pending;
+        data.labels = [];
+        f.app.view(target, { labels: [{ name: "unrelated" }] });
+        const undo = f.app.undo();
+        const request = f.requests.find((entry, i) => i > 0 && entry.action === "label");
+        assert.ok(request, "Undo must send a write even when the original item is not open");
+        assert.deepEqual(request.input, { repository: "o/r", number: 5, label: "bug", add: false });
+        request.resolve({ labels: [], state });
+        await undo;
+    });
+}
+
+test("close with comment finishes after returning to a still-loading detail view", async () => {
+    const f = clientFixture();
+    f.app.setState(clientState());
+    f.app.view("o/r#5", { comments: { nodes: [], total: 0 } });
+    f.elements.get("composer-text").value = "Done";
+    f.app.drafts.set("o/r#5", "Done");
+    const pending = f.app.postComment({ thenState: "closed" });
+    f.app.view(null);
+    f.elements.delete("composer-text");
+    f.app.view("o/r#5");
+    f.requests[0].resolve({ comment: { id: 9 } });
+    await flushClient();
+    const request = f.requests.find(entry => entry.action === "set_item_state");
+    assert.ok(request, "a missing composer must not stop the close after posting the comment");
+    assert.deepEqual(request.input, { repository: "o/r", number: 5, state: "closed" });
+    request.resolve({ state: clientState(), itemState: "closed" });
+    await pending;
+    assert.equal(f.app.busy.size, 0);
+    assert.equal(f.app.drafts.has("o/r#5"), false);
+    assert.equal(f.elements.get("toast").classList.contains("is-error"), false);
+});
+
+// ---------- Copilot Projects ----------
+
+const selection = repos => `<agent_repository_selection>\nThe user selected these GitHub repositories for this Agent: ${repos}\nTheir selected outcome is: \n</agent_repository_selection>`;
+
+async function writeEvents(home, sessionId, events) {
+    const directory = join(home, "session-state", sessionId);
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "events.jsonl"), `${events.map(event => typeof event === "string" ? event : JSON.stringify(event)).join("\n")}\n`);
+}
+
+test("Project repos come from the kickoff selection and completed add_repository calls", async () => {
+    assert.deepEqual(selectedRepos(selection("o/a, o/b.")), ["o/a", "o/b"]);
+    assert.deepEqual(selectedRepos("no selection here: o/a"), []);
+    assert.equal(addedRepo({ clone_url: "https://github.com/o/c.git" }), "o/c");
+    assert.equal(addedRepo({ path: "/tmp/x" }), null);
+    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    try {
+        const start = (id, args) => ({ type: "tool.execution_start", data: { toolCallId: id, toolName: "add_repository", arguments: args } });
+        const done = (id, success) => ({ type: "tool.execution_complete", data: { toolCallId: id, success } });
+        await writeEvents(home, "project-1", [
+            { type: "session.start", data: {} },
+            { type: "system.message", data: { role: "system", content: "<copilot_persistent_agent>coordinator</copilot_persistent_agent>" } },
+            { type: "user.message", data: { content: selection("o/a, O/b") } },
+            "{ not json",
+            start("t1", { github_repo: "o/c" }), done("t1", true),
+            start("t2", { github_repo: "o/failed" }), done("t2", false),
+            start("t3", { github_repo: "o/unfinished" }),
+            start("t4", { github_repo: "o/a" }), done("t4", true),
+        ]);
+        assert.deepEqual(await detectProjectRepos({ sessionId: "project-1", home }), ["o/a", "O/b", "o/c"]);
+        await writeEvents(home, "chat-1", [
+            { type: "system.message", data: { content: "<copilot_general_chat>chat</copilot_general_chat>" } },
+            { type: "user.message", data: { content: selection("o/a") } },
+        ]);
+        assert.equal(await detectProjectRepos({ sessionId: "chat-1", home }), null, "a chat is not a Project");
+        const getEvents = async () => [{ type: "system.message", data: { content: "<copilot_persistent_agent>" } }, start("t5", { github_repo: "o/live" }), done("t5", true)];
+        assert.deepEqual(await detectProjectRepos({ sessionId: "missing", home, getEvents }), ["o/live"], "falls back to the SDK history");
+    } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a Project keeps its own tracking file, seeded from the global one", async () => {
+    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    try {
+        const global = createTrackingStore(home);
+        await global.write({ repos: ["o/global"], hidden: ["bot"] });
+        const raw = JSON.parse(await readFile(global.path, "utf8"));
+        await writeFile(global.path, JSON.stringify({ ...raw, limit: 3 }));
+        const store = createTrackingStore(home, { project: "project-1" });
+        assert.equal(store.path, join(home, "extensions", "team-load", "artifacts", "projects", "project-1.json"));
+        assert.deepEqual(await store.read(), { repos: [], hidden: ["bot"], knownRepos: ["o/global"], limit: 3, refreshSeconds: 300, projectRepos: [] });
+        await store.write({ repos: ["o/a"], hidden: [], projectRepos: ["o/a", "o/b"] });
+        const saved = JSON.parse(await readFile(store.path, "utf8"));
+        assert.deepEqual([saved.project, saved.repos, saved.projectRepos, "limit" in saved], ["project-1", ["o/a"], ["o/a", "o/b"], false]);
+        assert.deepEqual((await store.read()).projectRepos, ["o/a", "o/b"]);
+        assert.deepEqual((await global.read()).repos, ["o/global"], "the global tracking is untouched");
+        assert.throws(() => createTrackingStore(home, { project: "../escape" }), error => error.code === "invalid_input");
+    } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("Project repos are tracked once, so removed ones stay removed, and the cap is respected", async () => {
+    const home = await mkdtemp(join(tmpdir(), "team-load-"));
+    try {
+        const { github } = hubFixture();
+        const hub = createHub({ store: createTrackingStore(home, { project: "project-1" }), github, project: true });
+        assert.deepEqual(await hub.addProjectRepos(["o/r", "o/solo"]), { added: ["o/r", "o/solo"], skipped: [] });
+        await settle(hub);
+        assert.equal(hub.state().project, true);
+        await hub.setTracking({ repos: ["o/r"] });
+        assert.deepEqual(await hub.addProjectRepos(["o/r", "o/solo"]), { added: [], skipped: [] });
+        assert.deepEqual(hub.state().tracking.repos, ["o/r"], "a repo the user stopped tracking is not re-added");
+        const many = Array.from({ length: 16 }, (_, i) => `o/p${i}`);
+        const result = await hub.addProjectRepos(["o/new", ...many]);
+        assert.deepEqual([result.added.length, result.skipped], [14, ["o/p13", "o/p14", "o/p15"]]);
+        assert.equal(hub.state().tracking.repos.length, 15);
+        await settle(hub);
+    } finally { await rm(home, { recursive: true, force: true }); }
+});
